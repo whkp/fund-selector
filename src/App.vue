@@ -4,13 +4,13 @@ import {
   Activity, ArrowDownUp, ArrowUpRight, BarChart3, BellRing, Bot, CalendarClock,
   Check, ChevronDown, ChevronRight, CircleAlert, Clock3, Compass, Database,
   FileSearch, Filter, Info, Landmark, LineChart, ListFilter, Menu, MoreHorizontal,
-  Plus, Radio, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Sparkles, Star, X
+  Plus, Radio, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Star, X
 } from 'lucide-vue-next'
 import type { Fund } from './types'
 import {
   addWatchlistItem, createResearchRun, fetchAIStatus, fetchFunds, fetchFundHistory, fetchMarketQuotes, fetchWatchlist,
   refreshMarketQuotes, removeWatchlistItem, type MarketQuote, type MarketQuoteResponse,
-  type AIStatus, type FundHistoryResponse, type MarketSourceStatus, type ResearchRun
+  type AIStatus, type FundHistoryResponse, type MarketSourceStatus, type ResearchRun, type SessionLLMConfig
 } from './services/fund-api'
 
 const activeNav = ref('基金筛选')
@@ -35,6 +35,10 @@ const loadError = ref('')
 const isResearchRunning = ref(false)
 const latestRun = ref<ResearchRun | null>(null)
 const aiStatus = ref<AIStatus | null>(null)
+const aiSettingsOpen = ref(false)
+const sessionLLM = ref<SessionLLMConfig>({
+  provider: 'openai-compatible', baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini', timeoutSeconds: 45,
+})
 const marketQuotes = ref<MarketQuote[]>([])
 const marketStatus = ref<MarketSourceStatus | null>(null)
 const marketDisclaimer = ref('场内交易价格仅作 ETF/LOF 行情参考，不等于基金正式净值。')
@@ -74,6 +78,7 @@ const aiModeLabel = computed(() => {
   if (aiStatus.value.status === 'NOT_CONFIGURED') return '模型未配置'
   return `${aiStatus.value.provider} · ${aiStatus.value.model}`
 })
+const hasSessionLLM = computed(() => Boolean(sessionLLM.value.apiKey.trim()))
 const marketAsOf = computed(() => marketStatus.value?.lastSuccessAt ? formatTime(marketStatus.value.lastSuccessAt) : '尚无成功快照')
 const dataModeLabel = computed(() => {
   const fund = availableFunds.value[0]
@@ -135,7 +140,7 @@ async function runResearch() {
   }
   isResearchRunning.value = true
   try {
-    const run = await createResearchRun(query.value, maxFee.value, riskLimit.value)
+    const run = await createResearchRun(query.value, maxFee.value, riskLimit.value, hasSessionLLM.value ? sessionLLM.value : undefined)
     latestRun.value = run
     availableFunds.value = run.candidates.map((candidate) => candidate.fund)
     notify(`研究完成：通过硬约束的候选 ${run.candidates.length} 只`)
@@ -144,6 +149,12 @@ async function runResearch() {
   } finally {
     isResearchRunning.value = false
   }
+}
+
+function clearSessionLLM() {
+  sessionLLM.value = { ...sessionLLM.value, apiKey: '' }
+  aiSettingsOpen.value = false
+  notify('已清除本次会话模型 Key')
 }
 
 async function openFund(fund: Fund) {
@@ -312,7 +323,7 @@ onBeforeUnmount(() => {
           </div>
 
           <section class="query-panel">
-            <div class="query-head"><div class="query-label"><Bot :size="18" /><span>描述你的研究目标</span></div><div class="query-engine"><span class="mode-label">{{ aiModeLabel }}</span></div></div>
+            <div class="query-head"><div class="query-label"><Bot :size="18" /><span>描述你的研究目标</span></div><div class="query-engine"><span class="mode-label">{{ aiModeLabel }}</span><button class="ai-config-trigger" title="设置本次会话的大模型" @click="aiSettingsOpen = true"><Settings2 :size="14" />{{ hasSessionLLM ? '本次会话模型' : '设置我的模型' }}</button></div></div>
             <div class="query-input-row">
               <textarea v-model="query" aria-label="研究目标" rows="2"></textarea>
               <button class="run-button" :disabled="isResearchRunning" @click="runResearch"><Sparkles :size="17" />{{ isResearchRunning ? '研究中...' : '开始研究' }}</button>
@@ -448,6 +459,7 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="traceOpen" class="overlay trace-overlay" @click.self="traceOpen = false"><section class="trace-modal"><header><div><p class="eyebrow">RECOMMENDATION TRACE</p><h2>本次研究记录</h2><p>{{ latestRun?.runId ?? '尚未运行研究' }} · {{ latestRun?.mode ?? 'LLM_RESEARCH' }}</p></div><button class="icon-button" aria-label="关闭研究记录" @click="traceOpen = false"><X :size="19" /></button></header><div class="trace-timeline"><div v-for="(step, index) in activeTrace" :key="step.title" class="trace-step"><span>{{ index + 1 }}</span><div><b>{{ step.title }}</b><p>{{ step.detail }}</p></div><Check :size="17" /></div></div><div class="trace-data"><div><span>模型版本</span><b>{{ latestRun?.modelVersion ?? aiModeLabel }}</b></div><div><span>模型状态</span><b>{{ latestRun?.interpretation.provider ?? aiModeLabel }}</b></div><div><span>数据模式</span><b>{{ dataModeLabel }}</b></div><div><span>结果校验</span><b class="positive">候选代码与数据快照已校验</b></div></div><div class="trace-warning"><CircleAlert :size="17" /><p>模型根据用户目标、真实候选数据与可引用知识片段生成研究结论；基金事实、数据来源和硬性边界由服务端校验，结果不构成交易指令。</p></div></section></div>
+    <div v-if="aiSettingsOpen" class="overlay ai-config-overlay" @click.self="aiSettingsOpen = false"><section class="ai-config-modal" aria-label="本次会话模型设置"><header><div><p class="eyebrow">SESSION-ONLY BYOK</p><h2>设置我的大模型</h2><p>API Key 只保存在当前页面内存中，仅随研究请求发送；不会保存到服务器、浏览器存储或研究记录。</p></div><button class="icon-button" aria-label="关闭模型设置" @click="aiSettingsOpen = false"><X :size="19" /></button></header><div class="ai-engine-state"><span class="pulse-dot"></span><div><b>{{ hasSessionLLM ? `${sessionLLM.provider} · ${sessionLLM.model}` : '尚未设置会话模型' }}</b><small>{{ hasSessionLLM ? '本次会话研究将使用你的 API Key' : '未设置时使用服务端开发配置（若已配置）' }}</small></div></div><div class="ai-config-form"><label>Provider<select v-model="sessionLLM.provider"><option value="openai-compatible">OpenAI-compatible</option><option value="ollama">Ollama</option></select></label><label>Base URL<input v-model.trim="sessionLLM.baseUrl" type="url" autocomplete="off" placeholder="https://api.openai.com/v1" /></label><label>Model<input v-model.trim="sessionLLM.model" type="text" autocomplete="off" placeholder="gpt-4o-mini" /></label><label>API Key<input v-model="sessionLLM.apiKey" type="password" autocomplete="off" placeholder="仅本次会话使用" /></label><p class="ai-config-hint"><ShieldCheck :size="15" />离开或刷新页面后，当前 Key 会从浏览器内存中消失。公网模型地址必须使用 HTTPS，并且需要通过服务端域名白名单。</p><footer><button class="secondary-action" @click="clearSessionLLM">清除 Key</button><button class="run-button" @click="aiSettingsOpen = false">完成</button></footer></div></section></div>
     <div v-if="toast" class="toast"><Check :size="17" />{{ toast }}</div>
   </main>
 </template>

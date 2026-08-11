@@ -100,6 +100,41 @@ def test_recommendation_run_can_be_replayed():
     assert run["candidates"][0]["sourceSummary"]["officialDisclosureChecked"] is False
 
 
+def test_session_llm_requires_a_key_and_does_not_fallback_to_global_rules():
+    response = client.post("/api/recommendations/runs", json={
+        "query": "短期测试", "limit": 1,
+        "filters": {"maxFee": 1.2},
+        "llm": {"provider": "openai-compatible", "baseUrl": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
+    })
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "INVALID_LLM_CONFIGURATION"
+
+
+def test_session_llm_key_is_not_written_to_research_run(monkeypatch: pytest.MonkeyPatch):
+    async def fake_session_research(query: str, funds: list[Fund], knowledge: list[object], limit: int) -> ModelResearchOutput:
+        return ModelResearchOutput(
+            intent="会话模型测试", themes=[], ambiguities=[], summary="仅用于测试的会话模型输出。",
+            ranking=[ModelAssessment(fundCode=funds[0].code, score=88, fit="测试匹配", reason="测试字段", riskFlags=[])],
+            followUpQuestions=[],
+        )
+
+    class SessionService:
+        provider = "openai-compatible"
+        model = "session-model"
+
+        async def research(self, query: str, funds: list[Fund], knowledge: list[object], limit: int) -> ModelResearchOutput:
+            return await fake_session_research(query, funds, knowledge, limit)
+
+    monkeypatch.setattr(llm_service, "for_session_request", lambda overrides: SessionService())
+    response = client.post("/api/recommendations/runs", json={
+        "query": "会话测试", "limit": 1, "filters": {},
+        "llm": {"provider": "openai-compatible", "baseUrl": "https://api.deepseek.com/v1", "apiKey": "session-secret", "model": "deepseek-chat"},
+    })
+    assert response.status_code == 200
+    assert "session-secret" not in response.text
+    assert response.json()["interpretation"]["provider"] == "openai-compatible"
+
+
 def test_watchlist_lifecycle():
     created = client.post("/api/watchlist/items", json={"fundCode": "008286", "reasonTags": ["新能源"]})
     assert created.status_code == 201

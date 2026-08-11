@@ -24,6 +24,14 @@ export type AIStatus = {
   message: string
 }
 
+export type SessionLLMConfig = {
+  provider: 'openai-compatible' | 'ollama'
+  baseUrl: string
+  apiKey: string
+  model: string
+  timeoutSeconds?: number
+}
+
 export type MarketQuote = {
   code: string
   name: string
@@ -105,13 +113,14 @@ export async function fetchAIStatus(): Promise<AIStatus> {
   return request<AIStatus>('/ai/status')
 }
 
-export async function createResearchRun(query: string, maxFee: number, riskLevelMax: string): Promise<ResearchRun> {
+export async function createResearchRun(query: string, maxFee: number, riskLevelMax: string, llm?: SessionLLMConfig): Promise<ResearchRun> {
   return request<ResearchRun>('/recommendations/runs', {
     method: 'POST',
     body: JSON.stringify({
       query,
       limit: 10,
       filters: { riskLevelMax, maxFee, requireOpen: true },
+      ...(llm ? { llm } : {}),
     }),
   })
 }

@@ -36,7 +36,7 @@ export FUND_COMPASS_LLM_MODEL=your-model
 FUND_COMPASS_MODE=REFERENCE .venv/bin/python backend/run.py
 ```
 
-页面只读取 `GET /api/ai/status` 的 provider 和模型状态，不接收或回显密钥。当前 MVP 已移除网页 API Key 配置入口，避免访客修改全局 provider、触发出站滥用或提交密钥到不受控服务端。
+页面只读取 `GET /api/ai/status` 的服务端状态，同时提供会话级 BYOK 设置入口。用户填写的 Key 只随本次研究请求发送，不写入服务器配置、研究记录、日志或浏览器持久化存储。
 
 模型调用失败、超时或结构化输出不符合 Schema 时，研究请求返回明确错误；系统不会回退为规则推荐或模拟结果。基金事实、硬约束和数据来源始终由服务端真实数据管道负责。
 
@@ -68,3 +68,9 @@ Agent 不可以：
 - 访问任意用户 URL、拼接 SQL 或直接调用 AKShare。
 
 真实云端模型上线前仍需完成密钥管理、host allowlist、调用限额、隐私提示、日志脱敏和成本监控。当前 Adapter 使用 OpenAI Chat Completions 兼容协议，并要求模型返回结构化 JSON；服务端会校验基金代码只能来自真实候选集合。
+
+## 公网短期 BYOK
+
+页面的“设置我的模型”支持 `openai-compatible` 和 `ollama`。API Key 只保存在当前 Vue 页面内存，并在 `POST /api/recommendations/runs` 的本次请求中发送；后端创建一次性 `LLMService`，请求结束后不写入全局配置、数据库、Recommendation Run、Trace、日志或浏览器存储。刷新或离开页面后 Key 从前端内存消失。
+
+公网会话只允许 HTTPS 和服务端白名单域名；本机 Ollama 地址默认拒绝，开发者本地测试可在 `config/fund-compass.json` 设置 `app.allow_local_llm=true`。当前模式不支持账号级持久化 Key，正式版需要用户认证、KMS/Secret Manager 加密和用户级限流。

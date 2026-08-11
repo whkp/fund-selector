@@ -3,7 +3,7 @@ import asyncio
 import httpx
 import pytest
 
-from app.llm import LLMResponseError, LLMService
+from app.llm import LLMConfigurationError, LLMResponseError, LLMService
 from app.models import Fund
 
 
@@ -80,3 +80,11 @@ def test_llm_rejects_codes_outside_the_actual_candidate_pool(monkeypatch: pytest
     monkeypatch.setattr("app.llm.httpx.AsyncClient", FakeClient)
     with pytest.raises(LLMResponseError, match="候选列表之外"):
         asyncio.run(LLMService().research("测试", [fund()], [], 3))
+
+
+def test_session_endpoint_rejects_untrusted_or_plaintext_hosts(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("FUND_COMPASS_LLM_ALLOWED_HOSTS", "api.deepseek.com")
+    with pytest.raises(LLMConfigurationError, match="白名单"):
+        LLMService({"provider": "openai-compatible", "baseUrl": "https://evil.example/v1", "apiKey": "x", "model": "m"}).validate_session_endpoint()
+    with pytest.raises(LLMConfigurationError, match="HTTPS"):
+        LLMService({"provider": "openai-compatible", "baseUrl": "http://api.deepseek.com/v1", "apiKey": "x", "model": "m"}).validate_session_endpoint()

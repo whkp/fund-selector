@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from .config import config_value
 from .knowledge import build_knowledge_base
-from .llm import LLMError, LLMNotConfigured, LLMResponseError, LLMService
+from .llm import LLMConfigurationError, LLMError, LLMNotConfigured, LLMResponseError, LLMService
 from .models import Fund
 from .providers import AKShareProvider, DataRepository
 
@@ -36,10 +36,19 @@ class Filters(BaseModel):
     minimumInceptionYears: float = 0
 
 
+class LLMRequestConfig(BaseModel):
+    provider: str = Field(default="openai-compatible", max_length=40)
+    baseUrl: str = Field(default="", max_length=500)
+    apiKey: str = Field(default="", max_length=512)
+    model: str = Field(default="", max_length=160)
+    timeoutSeconds: float = Field(default=45, ge=5, le=120)
+
+
 class ScreenRequest(BaseModel):
     query: str = ""
     filters: Filters = Field(default_factory=Filters)
     limit: int = Field(default=10, ge=1, le=50)
+    llm: LLMRequestConfig | None = None
 
 
 class WatchRequest(BaseModel):
@@ -214,8 +223,13 @@ async def create_run(request: ScreenRequest) -> dict[str, Any]:
     await repository.ensure_funds()
     items = research_pool(request)
     knowledge = await knowledge_base.search(request.query, limit=5)
+    research_llm = llm_service
     try:
-        model_output = await llm_service.research(request.query, items, knowledge, request.limit)
+        if request.llm is not None:
+            research_llm = llm_service.for_session_request(request.llm.model_dump(exclude_none=True))
+        model_output = await research_llm.research(request.query, items, knowledge, request.limit)
+    except LLMConfigurationError as exc:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_LLM_CONFIGURATION", "message": str(exc)}) from exc
     except LLMNotConfigured as exc:
         raise HTTPException(status_code=503, detail={"code": "LLM_NOT_CONFIGURED", "message": str(exc)}) from exc
     except LLMResponseError as exc:
@@ -235,9 +249,9 @@ async def create_run(request: ScreenRequest) -> dict[str, Any]:
     run = {"runId": run_id, "status": "COMPLETED", "mode": f"{MODE}_LLM_RESEARCH",
            "originalQuery": request.query, "createdAt": datetime.now(timezone.utc).isoformat(),
            "completedAt": datetime.now(timezone.utc).isoformat(), "policyVersion": "research-policy-v1",
-           "modelVersion": f"{llm_service.provider}:{llm_service.model}", "snapshotId": f"{MODE.lower()}-snapshot",
+           "modelVersion": f"{research_llm.provider}:{research_llm.model}", "snapshotId": f"{MODE.lower()}-snapshot",
            "interpretation": {"intent": model_output.intent, "themes": model_output.themes,
-                              "ambiguities": model_output.ambiguities, "provider": llm_service.provider, "status": "COMPLETED"},
+                              "ambiguities": model_output.ambiguities, "provider": research_llm.provider, "status": "COMPLETED"},
            "summary": model_output.summary, "knowledgeRefs": [item.__dict__ for item in knowledge],
            "candidates": [{"fund": fund.as_dict(), "rank": index + 1, "decision": "LLM_REFERENCE_CANDIDATE",
                            "hardFilterPassed": True, "evidenceRefs": [f"profile:{fund.code}:{fund.snapshot}", f"nav:{fund.code}:{fund.nav_date}"],
