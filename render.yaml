@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: fund-compass-api
+    runtime: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: FUND_COMPASS_MODE
+        value: REFERENCE
+      - key: FUND_COMPASS_AKSHARE_ENABLED
+        value: "true"
+      - key: FUND_COMPASS_LLM_PROVIDER
+        sync: false
+      - key: FUND_COMPASS_LLM_BASE_URL
+        sync: false
+      - key: FUND_COMPASS_LLM_API_KEY
+        sync: false
+      - key: FUND_COMPASS_LLM_MODEL
+        sync: false
+      - key: FUND_COMPASS_KNOWLEDGE_BASE_PATH
+        value: ""

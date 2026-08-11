@@ -1,0 +1,23 @@
+{
+  "name": "fund-compass-mvp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "api": "cd backend && ../.venv/bin/python run.py",
+    "worker": "cd backend && ../.venv/bin/python -m app.workers.scheduler",
+    "build": "vue-tsc -b && vite build",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "lucide-vue-next": "^0.468.0",
+    "vite": "^6.0.5",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "typescript": "~5.7.2",
+    "vue-tsc": "^2.2.0"
+  }
+}
