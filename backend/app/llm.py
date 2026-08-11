@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+from ipaddress import ip_address
+from urllib.parse import urlparse
 from typing import Any
 
 import httpx
@@ -22,6 +24,10 @@ class LLMNotConfigured(LLMError):
 
 
 class LLMResponseError(LLMError):
+    pass
+
+
+class LLMConfigurationError(LLMError):
     pass
 
 
@@ -45,12 +51,58 @@ class ModelResearchOutput(BaseModel):
 class LLMService:
     """OpenAI-compatible research adapter with strict, fact-grounded output."""
 
-    def __init__(self) -> None:
-        self.provider = str(config_value("llm", "provider", "openai-compatible", env_name="FUND_COMPASS_LLM_PROVIDER")).strip().lower()
-        self.model = str(config_value("llm", "model", "gpt-4o-mini", env_name="FUND_COMPASS_LLM_MODEL")).strip()
-        self.base_url = str(config_value("llm", "base_url", "", env_name="FUND_COMPASS_LLM_BASE_URL")).strip().rstrip("/")
-        self.api_key = str(config_value("llm", "api_key", "", env_name="FUND_COMPASS_LLM_API_KEY")).strip()
-        self.timeout = float(config_value("llm", "timeout_seconds", 45, env_name="FUND_COMPASS_LLM_TIMEOUT_SECONDS"))
+    def __init__(self, overrides: dict[str, Any] | None = None) -> None:
+        overrides = overrides or {}
+        self.provider = str(overrides.get("provider", config_value(
+            "llm", "provider", "openai-compatible", env_name="FUND_COMPASS_LLM_PROVIDER"
+        ))).strip().lower()
+        self.model = str(overrides.get("model", config_value(
+            "llm", "model", "gpt-4o-mini", env_name="FUND_COMPASS_LLM_MODEL"
+        ))).strip()
+        self.base_url = str(overrides.get("baseUrl", overrides.get("base_url", config_value(
+            "llm", "base_url", "", env_name="FUND_COMPASS_LLM_BASE_URL"
+        )))).strip().rstrip("/")
+        self.api_key = str(overrides.get("apiKey", overrides.get("api_key", config_value(
+            "llm", "api_key", "", env_name="FUND_COMPASS_LLM_API_KEY"
+        )))).strip()
+        self.timeout = float(overrides.get("timeoutSeconds", overrides.get("timeout_seconds", config_value(
+            "llm", "timeout_seconds", 45, env_name="FUND_COMPASS_LLM_TIMEOUT_SECONDS"
+        ))))
+
+    def for_session_request(self, overrides: dict[str, Any]) -> "LLMService":
+        service = LLMService(overrides)
+        service.validate_session_endpoint()
+        return service
+
+    def validate_session_endpoint(self) -> None:
+        if self.provider not in {"openai-compatible", "ollama"}:
+            raise LLMConfigurationError("暂不支持该模型 Provider")
+        if not self.model or len(self.model) > 160:
+            raise LLMConfigurationError("模型名称无效")
+        if self.provider == "openai-compatible" and not self.api_key:
+            raise LLMConfigurationError("会话模式必须提供 API Key")
+        parsed = urlparse(self.base_url or "http://127.0.0.1:11434/v1")
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise LLMConfigurationError("Base URL 必须是有效的 HTTP(S) 地址")
+        is_local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        if is_local:
+            allow_local = str(config_value("app", "allow_local_llm", False, env_name="FUND_COMPASS_ALLOW_LOCAL_LLM")).lower() == "true"
+            if not allow_local:
+                raise LLMConfigurationError("公网会话不允许访问本机地址；本地测试请开启 FUND_COMPASS_ALLOW_LOCAL_LLM")
+            return
+        if parsed.scheme != "https":
+            raise LLMConfigurationError("公网模型地址必须使用 HTTPS")
+        try:
+            if ip_address(parsed.hostname).is_private:
+                raise LLMConfigurationError("不允许访问内网模型地址")
+        except ValueError:
+            pass
+        allowed = {host.strip().lower() for host in str(os.getenv(
+            "FUND_COMPASS_LLM_ALLOWED_HOSTS",
+            "api.openai.com,api.deepseek.com,dashscope.aliyuncs.com,api.moonshot.cn,api.siliconflow.cn,openrouter.ai,api.z.ai"
+        )).split(",") if host.strip()}
+        if parsed.hostname.lower() not in allowed:
+            raise LLMConfigurationError("该模型域名未在服务端白名单中")
 
     def status(self) -> dict[str, object]:
         configured = self.provider in {"openai-compatible", "ollama"} and bool(self.model)

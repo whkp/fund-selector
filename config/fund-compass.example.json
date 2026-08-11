@@ -3,7 +3,8 @@
     "address": "127.0.0.1:8080"
   },
   "app": {
-    "mode": "REFERENCE"
+    "mode": "REFERENCE",
+    "allow_local_llm": false
   },
   "llm": {
     "provider": "openai-compatible",
