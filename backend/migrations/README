@@ -1,0 +1,8 @@
+# Alembic migrations
+
+Run from the backend directory:
+
+    ../.venv/bin/alembic upgrade head
+    ../.venv/bin/alembic downgrade -1
+
+Set FUND_COMPASS_DATABASE_URL to an async PostgreSQL URL in staging and production.

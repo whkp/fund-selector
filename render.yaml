@@ -8,6 +8,12 @@ services:
     envVars:
       - key: FUND_COMPASS_MODE
         value: REFERENCE
+      - key: FUND_COMPASS_PUBLIC_WRITE_ENABLED
+        value: "false"
+      - key: FUND_COMPASS_PUBLIC_RESEARCH_ENABLED
+        value: "false"
+      - key: FUND_COMPASS_CORS_ORIGINS
+        sync: false
       - key: FUND_COMPASS_AKSHARE_ENABLED
         value: "true"
       - key: FUND_COMPASS_LLM_PROVIDER

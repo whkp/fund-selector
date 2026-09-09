@@ -8,6 +8,7 @@ os.environ["FUND_COMPASS_AKSHARE_ENABLED"] = "false"
 os.environ["FUND_COMPASS_MODE"] = "REFERENCE"
 
 from app.llm import ModelAssessment, ModelResearchOutput
+import app.main as main_module
 from app.main import app, llm_service, repository
 from app.models import Fund
 
@@ -135,7 +136,10 @@ def test_session_llm_key_is_not_written_to_research_run(monkeypatch: pytest.Monk
     assert response.json()["interpretation"]["provider"] == "openai-compatible"
 
 
-def test_watchlist_lifecycle():
+def test_watchlist_lifecycle(monkeypatch: pytest.MonkeyPatch):
+    # Local integration behavior is exercised explicitly; public Reference mode
+    # is otherwise read-only by default.
+    monkeypatch.setattr("app.main.PUBLIC_WRITE_ENABLED", True)
     created = client.post("/api/watchlist/items", json={"fundCode": "008286", "reasonTags": ["新能源"]})
     assert created.status_code == 201
     assert client.get("/api/watchlist/items").json()["items"]
@@ -145,6 +149,20 @@ def test_watchlist_lifecycle():
 def test_compare_rejects_more_than_four_funds():
     response = client.post("/api/funds/compare", json={"codes": ["008286", "012349", "012861", "004640", "017327"]})
     assert response.status_code == 400
+
+
+def test_reference_mode_is_read_only_by_default():
+    response = client.post("/api/watchlist/items", json={"fundCode": "008286"})
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "PUBLIC_WRITE_DISABLED"
+
+
+def test_production_mode_requires_a_production_data_source(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(main_module, "MODE", "PRODUCTION")
+    monkeypatch.setattr(main_module, "PRODUCTION_DATA_READY", False)
+    response = client.get("/api/funds")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "PRODUCTION_DATA_NOT_READY"
 
 
 def test_history_endpoint_is_explicit_when_provider_is_unavailable():

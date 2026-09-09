@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
-from .config import config_value
+from .config import config_value, llm_configuration_source
 from .knowledge import KnowledgeChunk
 from .models import Fund
 
@@ -113,7 +113,7 @@ class LLMService:
             "model": self.model,
             "status": "READY" if configured else "NOT_CONFIGURED",
             "credentials": "server-side",
-            "configurationSource": "environment",
+            "configurationSource": llm_configuration_source(),
             "message": "模型将根据真实候选数据生成结构化研究结果。" if configured else "请在服务端环境变量配置 LLM。",
         }
 

@@ -1,6 +1,6 @@
 # FastAPI 无 Docker 的 LLM 接入方案
 
-基金罗盘当前由 FastAPI/Python 服务端通过标准 HTTP(S) 调用 LLM，不依赖 Docker。模型只负责受限的研究意图理解、解释和追问；基金事实、数据质量、硬约束、评分和仓位复核信号由 Python 确定性服务生成。
+基金罗盘当前由 FastAPI/Python 服务端通过标准 HTTP(S) 调用 LLM，不依赖 Docker。服务端负责基金事实、数据来源、数据质量门禁和用户明确的硬约束；模型只在服务端筛出的候选池内完成意图理解、研究解释、临时排序和追问。正式版的确定性 `research-score-v1` 尚未替换当前模型排序分，因此当前模型返回的 `score` 只能视为研究展示分，不能视为经过回测验证的投资评分。
 
 ## Provider
 
@@ -39,6 +39,36 @@ FUND_COMPASS_MODE=REFERENCE .venv/bin/python backend/run.py
 页面只读取 `GET /api/ai/status` 的服务端状态，同时提供会话级 BYOK 设置入口。用户填写的 Key 只随本次研究请求发送，不写入服务器配置、研究记录、日志或浏览器持久化存储。
 
 模型调用失败、超时或结构化输出不符合 Schema 时，研究请求返回明确错误；系统不会回退为规则推荐或模拟结果。基金事实、硬约束和数据来源始终由服务端真实数据管道负责。
+
+## 当前实际研究链路（2026-09-10）
+
+当前研究接口是“服务端预处理 + 单次模型调用 + 服务端校验”，不是把用户原话直接转发给模型，也不是多轮 Agent。一次 `POST /api/recommendations/runs` 的执行顺序固定为：
+
+```text
+用户目标与筛选条件
+  -> 服务端硬约束筛选（基金类型、风险、费率、开放申购、成立年限）
+  -> 读取最多 60 只候选基金
+  -> KnowledgeBase.search(query, limit=5)
+  -> 一次 POST {base_url}/chat/completions
+  -> Pydantic JSON Schema 校验
+  -> 候选基金代码白名单、去重和数量校验
+  -> 将模型解释绑定回服务端基金事实
+  -> 生成 Recommendation Run、候选和 Trace
+```
+
+模型请求由 `backend/app/llm.py::LLMService.research()` 组装，包含：
+
+- system 约束：只能使用候选事实和知识片段，不得创建基金、补全缺失字段、编造数字、预测收益或生成交易指令；
+- user JSON：`query`、最多 60 只候选基金的压缩字段、最多 5 个知识片段和 `limit`；
+- `temperature: 0.2`；
+- `response_format: {"type": "json_object"}`；
+- OpenAI-compatible 或 Ollama 的单个 `/chat/completions` 请求。
+
+模型输出结构为 `intent`、`themes`、`ambiguities`、`summary`、`ranking` 和 `followUpQuestions`。其中每个 `ranking` 项包含 `fundCode`、`score`、`fit`、`reason` 和 `riskFlags`。服务端拒绝格式错误、候选池之外的基金代码和无效字段；重复代码会去重，结果数量会截断到请求上限。服务端随后使用原始基金对象重新填充名称、净值、来源、快照和数据质量字段，模型不能覆盖这些事实。
+
+当前明确不包含：模型自主调用 AKShare、联网搜索、工具调用循环、多轮追问后再次调用模型、模型复核模型、流式输出，或在 LLM 失败时回退成规则推荐。未配置模型、上游超时、HTTP 错误或 JSON/Schema/候选代码校验失败时，接口返回可解释的失败状态，事实查询仍可用。
+
+当前知识库为可选的本地 Markdown 词法检索（未配置时传空列表），并非向量 RAG 或联网检索。后续接入 pgvector、Milvus 或外部检索服务时，应保持同一 `KnowledgeBase` 协议，并继续由服务端控制候选和证据边界。
 
 ## 知识库接口
 

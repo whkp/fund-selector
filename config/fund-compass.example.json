@@ -1,10 +1,15 @@
 {
   "server": {
-    "address": "127.0.0.1:8080"
+    "address": "127.0.0.1:8080",
+    "database_url": "sqlite+aiosqlite:///./data/fund-compass.db"
   },
   "app": {
     "mode": "REFERENCE",
-    "allow_local_llm": false
+    "allow_local_llm": false,
+    "production_data_ready": false,
+    "public_write_enabled": false,
+    "public_research_enabled": true,
+    "cors_origins": "http://127.0.0.1:4173,http://localhost:4173"
   },
   "llm": {
     "provider": "openai-compatible",

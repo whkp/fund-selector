@@ -10,3 +10,4 @@ coverage.out
 *.log
 config/fund-compass.json
 config/*.local.json
+data/

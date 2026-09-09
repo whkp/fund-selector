@@ -20,7 +20,7 @@ export type AIStatus = {
   model: string
   status: 'READY' | 'NOT_CONFIGURED'
   credentials: 'server-side'
-  configurationSource?: 'environment' | 'runtime-memory'
+  configurationSource?: 'environment' | 'config-file' | 'default' | 'runtime-memory'
   message: string
 }
 
@@ -113,14 +113,25 @@ export async function fetchAIStatus(): Promise<AIStatus> {
   return request<AIStatus>('/ai/status')
 }
 
-export async function createResearchRun(query: string, maxFee: number, riskLevelMax: string, llm?: SessionLLMConfig): Promise<ResearchRun> {
+export async function createResearchRun(query: string, maxFee: number, riskLevelMax: string, options?: {
+  fundTypes?: string[]
+  requireOpen?: boolean
+  minimumInceptionYears?: number
+  llm?: SessionLLMConfig
+}): Promise<ResearchRun> {
   return request<ResearchRun>('/recommendations/runs', {
     method: 'POST',
     body: JSON.stringify({
       query,
       limit: 10,
-      filters: { riskLevelMax, maxFee, requireOpen: true },
-      ...(llm ? { llm } : {}),
+      filters: {
+        riskLevelMax,
+        maxFee,
+        requireOpen: options?.requireOpen ?? true,
+        fundTypes: options?.fundTypes ?? [],
+        minimumInceptionYears: options?.minimumInceptionYears ?? 0,
+      },
+      ...(options?.llm ? { llm: options.llm } : {}),
     }),
   })
 }

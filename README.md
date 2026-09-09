@@ -45,7 +45,21 @@ npm run dev -- --port 4173
 
 浏览器访问 `http://127.0.0.1:4173/`，前端会通过 Vite 代理请求 `http://127.0.0.1:8080` 的 FastAPI。API 或 AKShare 不可用时，页面显示错误/空状态，不会展示模拟基金。
 
+Reference 模式默认只读。公网部署至少应保持 `FUND_COMPASS_PUBLIC_WRITE_ENABLED=false`，并将 `FUND_COMPASS_PUBLIC_RESEARCH_ENABLED` 设为 `false`，待认证和限流完成后再开放匿名研究。
+
+`PRODUCTION` 模式不会因为修改模式变量就自动获得生产数据。只有在已接入并审核生产数据源后，才设置 `FUND_COMPASS_PRODUCTION_DATA_READY=true`；否则 API 会返回 `PRODUCTION_DATA_NOT_READY`。
+
 AKShare 数据源状态使用 `GET /api/data-sources/status` 获取；基金目录/排行刷新使用 `POST /api/data/funds/refresh`。
+
+数据库骨架已包含 Alembic 迁移和独立基金目录 Worker。首次初始化本地数据库：
+
+```bash
+cd backend
+../.venv/bin/alembic upgrade head
+../.venv/bin/python -m app.workers.scheduler
+```
+
+Worker 会把目录结果写入 raw/profile 快照、任务表和 Outbox；相同 Provider 内容 hash 的重复同步会返回 `UNCHANGED`，不会重复写入同一份快照。
 
 ## 验证
 

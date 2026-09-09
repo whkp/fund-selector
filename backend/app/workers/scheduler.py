@@ -3,17 +3,15 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.providers import AKShareProvider, DataRepository
+from app.workers.fund_universe import sync_fund_universe
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 async def run_once() -> bool:
-    provider = AKShareProvider()
-    repository = DataRepository(provider)
-    updated = await repository.refresh_funds()
-    logging.info("fund universe refresh finished updated=%s status=%s", updated, provider.status.status)
-    return updated
+    result = await sync_fund_universe()
+    logging.info("fund universe refresh finished result=%s", result)
+    return bool(result.get("updated"))
 
 
 if __name__ == "__main__":

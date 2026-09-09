@@ -19,6 +19,7 @@ const fundType = ref('不限')
 const riskLimit = ref('中高风险')
 const theme = ref('新能源 / 制造')
 const maxFee = ref(1.2)
+const requireOpen = ref(true)
 const checked = ref(['期限 3 年', '中等风险', '定投方式', '开放申购'])
 const availableFunds = ref<Fund[]>([])
 const watchlist = ref<Fund[]>([])
@@ -129,6 +130,7 @@ function resetResearch() {
   riskLimit.value = '中高风险'
   theme.value = '新能源 / 制造'
   maxFee.value = 1.2
+  requireOpen.value = true
   notify('已恢复为本次研究条件')
 }
 
@@ -140,7 +142,12 @@ async function runResearch() {
   }
   isResearchRunning.value = true
   try {
-    const run = await createResearchRun(query.value, maxFee.value, riskLimit.value, hasSessionLLM.value ? sessionLLM.value : undefined)
+    const run = await createResearchRun(query.value, maxFee.value, riskLimit.value, {
+      fundTypes: fundType.value === '不限' ? [] : [fundType.value],
+      requireOpen: requireOpen.value,
+      minimumInceptionYears: checked.value.includes('期限 3 年') ? 3 : 0,
+      llm: hasSessionLLM.value ? sessionLLM.value : undefined,
+    })
     latestRun.value = run
     availableFunds.value = run.candidates.map((candidate) => candidate.fund)
     notify(`研究完成：通过硬约束的候选 ${run.candidates.length} 只`)
@@ -356,7 +363,7 @@ onBeforeUnmount(() => {
               <label class="filter-label slider-label">管理费上限 <strong>{{ maxFee.toFixed(2) }}%</strong></label>
               <input v-model.number="maxFee" class="fee-slider" type="range" min="0.4" max="1.5" step="0.1" />
               <div class="scale-row"><span>0.40%</span><span>1.50%</span></div>
-              <label class="toggle-row"><span><b>仅看开放申购</b><small>排除暂停与限额状态</small></span><input type="checkbox" checked /><i></i></label>
+              <label class="toggle-row"><span><b>仅看开放申购</b><small>排除暂停与限额状态</small></span><input v-model="requireOpen" type="checkbox" /><i></i></label>
               <div class="filter-foot"><ShieldCheck :size="17" /><p>硬约束由服务端校验，研究结论由已配置的大模型生成。</p></div>
             </aside>
 
