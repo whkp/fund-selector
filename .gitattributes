@@ -1,0 +1,9 @@
+# Shell 脚本与容器构建文件在 Linux 环境执行，必须保持 LF 行尾：
+# CRLF 会让 shebang 变成 `#!/usr/bin/env bash\r` 而无法执行，也可能导致
+# Docker 构建在解析指令时出错。
+*.sh text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+
+# 其余文本文件交给 git 自动判定行尾，Windows 检出为 CRLF 不影响使用。
+* text=auto
