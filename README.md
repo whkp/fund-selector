@@ -72,12 +72,8 @@ git diff --check
 
 构建产物位于 `dist/`。
 
-## GitHub Pages 与公网后端
+## 公网后端
 
-仓库包含 `.github/workflows/deploy-pages.yml`。推送 `main` 后，GitHub Actions 会将 Vue 前端部署到：
+前端产物是纯静态的（`dist/`），可部署到任意静态托管平台。静态托管无法承载 FastAPI、AKShare 或 LLM API，需另行部署后端；仓库提供了 `render.yaml`，可在 Render 以 Python 原生进程部署，不需要 Docker。部署后把后端 HTTPS 地址配置为前端构建变量 `VITE_API_BASE`。后端的 LLM Key 只配置在后端的 Secret 环境变量中，不暴露给前端。
 
-```text
-https://whkp.github.io/fund-selector/
-```
-
-GitHub Pages 只能运行静态前端，不能承载 FastAPI、AKShare 或 LLM API。要让手机端完整使用真实基金数据和大模型研究，需要先部署后端；仓库提供了 `render.yaml`，可在 Render 以 Python 原生进程部署，不需要 Docker。部署后将 Render 的 HTTPS 地址设置为 GitHub 仓库变量 `VITE_API_BASE`（值为例如 `https://fund-compass-api.onrender.com/api`），再重新运行 Pages 工作流。后端的 LLM Key 只配置在 Render 的 Secret 环境变量中，不放到前端或 GitHub Pages。
+> 配置 `VITE_API_BASE` 时请填写自己部署的服务地址。`fund-compass-api.onrender.com` 属于另一个项目，不是本仓库后端。
