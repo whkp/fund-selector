@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -35,7 +37,27 @@ provider = AKShareProvider()
 repository = DataRepository(provider)
 llm_service = LLMService()
 knowledge_base = build_knowledge_base()
-app = FastAPI(title="Fund Compass API", version="0.1.0")
+
+
+async def _warm_up() -> None:
+    """Warm the fund universe so the first request after a cold start is fast."""
+    try:
+        await repository.ensure_funds()
+    except Exception:
+        # Warm-up failure must not block startup; the first request retries.
+        pass
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    warmup = asyncio.create_task(_warm_up())
+    try:
+        yield
+    finally:
+        warmup.cancel()
+
+
+app = FastAPI(title="Fund Compass API", version="0.1.0", lifespan=lifespan)
 cors_origins = str(config_value(
     "app", "cors_origins", "http://127.0.0.1:4173,http://localhost:4173",
     env_name="FUND_COMPASS_CORS_ORIGINS"

@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+dist
+.venv
+venv
+**/__pycache__
+**/*.pyc
+docs
+src
+data
+*.log
+.env
+.env.local
+.env.*.local

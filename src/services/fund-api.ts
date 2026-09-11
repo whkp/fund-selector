@@ -1,6 +1,8 @@
 import type { Fund } from '../types'
 
-const apiBase = import.meta.env.VITE_API_BASE ?? '/api'
+// `||` not `??`: an unset VITE_API_BASE resolves to "" rather than null/undefined,
+// so `??` would let the empty string through and every request would hit the static host.
+const apiBase = import.meta.env.VITE_API_BASE || '/api'
 
 export type ResearchRun = {
   runId: string

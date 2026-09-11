@@ -9,6 +9,15 @@ from .config import config_value
 from .models import Fund, SourceStatus
 
 
+def _positive_int(value: Any, fallback: int) -> int:
+    """Coerce a config value into a positive integer, falling back on bad input."""
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
 class AKShareProvider:
     """AKShare adapter. Sync AKShare calls run off the FastAPI event loop."""
 
@@ -213,12 +222,30 @@ class AKShareProvider:
 
 
 class DataRepository:
+    """In-memory repository with TTL-bounded caches.
+
+    The public reference dataset is daily-frequency upstream data, so entries are
+    kept for a configurable window and refetched once stale. Without a TTL the
+    process would serve the first snapshot for its entire lifetime.
+    """
+
     def __init__(self, provider: AKShareProvider) -> None:
         self.provider = provider
         self.funds: dict[str, Fund] = {}
         self.histories: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.watchlist: dict[str, dict[str, Any]] = {}
         self.runs: dict[str, dict[str, Any]] = {}
+        self.funds_ttl_seconds = _positive_int(
+            config_value("repository", "funds_ttl_seconds", 21600, env_name="FUND_COMPASS_FUNDS_TTL_SECONDS"),
+            21600,
+        )
+        self.history_ttl_seconds = _positive_int(
+            config_value("repository", "history_ttl_seconds", 21600, env_name="FUND_COMPASS_HISTORY_TTL_SECONDS"),
+            21600,
+        )
+        self._funds_fetched_at: datetime | None = None
+        self._history_fetched_at: dict[tuple[str, str], datetime] = {}
+        self._funds_lock = asyncio.Lock()
 
     async def refresh_funds(self) -> bool:
         items = await self.provider.list_funds()
@@ -228,16 +255,49 @@ class DataRepository:
         # mix stale records into the current public reference dataset.
         self.funds = {item.code: item for item in items}
         self.histories.clear()
+        self._history_fetched_at.clear()
+        self._funds_fetched_at = datetime.now(timezone.utc)
         return True
 
+    def _funds_are_fresh(self) -> bool:
+        if not self.funds or self._funds_fetched_at is None:
+            return False
+        age = (datetime.now(timezone.utc) - self._funds_fetched_at).total_seconds()
+        return age < self.funds_ttl_seconds
+
     async def ensure_funds(self) -> bool:
-        return bool(self.funds) or await self.refresh_funds()
+        """Serve the cached universe while fresh, refetch once it expires.
+
+        Concurrent callers share a single upstream refresh. When the upstream
+        fails but a previous snapshot exists, the stale snapshot is served and the
+        retry is deferred to the next TTL window instead of hammering the source.
+        """
+        if self._funds_are_fresh():
+            return True
+        async with self._funds_lock:
+            if self._funds_are_fresh():
+                return True
+            if await self.refresh_funds():
+                return True
+            if self.funds:
+                self._funds_fetched_at = datetime.now(timezone.utc)
+                return True
+            return False
 
     async def history(self, code: str, period: str) -> list[dict[str, Any]]:
         cache_key = (code, period)
-        if cache_key not in self.histories:
-            self.histories[cache_key] = await self.provider.history(code, period)
-        return self.histories[cache_key]
+        fetched_at = self._history_fetched_at.get(cache_key)
+        if cache_key in self.histories and fetched_at is not None:
+            if (datetime.now(timezone.utc) - fetched_at).total_seconds() < self.history_ttl_seconds:
+                return self.histories[cache_key]
+        records = await self.provider.history(code, period)
+        if not records and cache_key in self.histories:
+            # Keep the last good window and defer the retry instead of caching a failure.
+            self._history_fetched_at[cache_key] = datetime.now(timezone.utc)
+            return self.histories[cache_key]
+        self.histories[cache_key] = records
+        self._history_fetched_at[cache_key] = datetime.now(timezone.utc)
+        return records
 
     def list_funds(self) -> list[Fund]:
         return sorted(self.funds.values(), key=lambda item: (-item.score, item.code))
