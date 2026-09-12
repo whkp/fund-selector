@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -193,3 +194,43 @@ def test_authenticated_user_gets_through_the_same_paths():
         response = client.get(path, headers=headers)
         # 008286 这类基金在当前测试语料里可能不存在，但绝不该是 401/403。
         assert response.status_code not in (401, 403), f"{path} -> {response.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# 回归防线：真实邀请码不得进入版本库
+# ---------------------------------------------------------------------------
+
+def test_live_invite_code_never_leaks_into_tracked_source():
+    """真实邀请码只该待在 backend/data/.invite-code（已被 .gitignore 覆盖）。
+
+    这条防线是被真实事故催生的：曾经把生产邀请码手抄进本文件的断言当夹具，
+    随提交进了 git 历史 —— 只差一次 push 就公开了。夹具一律用杜撰值。
+    """
+    live = ""
+    try:
+        if auth_module.DEFAULT_INVITE_FILE.exists():
+            live = auth_module.DEFAULT_INVITE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        pytest.skip("邀请码文件不可读")
+    if not live:
+        pytest.skip("尚未生成邀请码，无需检查")
+
+    root = Path(__file__).resolve().parents[2]
+    scanned_suffixes = {".py", ".ts", ".vue", ".json", ".cmd", ".sh", ".md", ".yaml", ".yml", ".html"}
+    scan_roots = [root / "backend" / "app", root / "backend" / "tests", root / "src", root / "scripts", root / "config"]
+
+    offenders: list[str] = []
+    for scan_root in scan_roots:
+        if not scan_root.exists():
+            continue
+        for path in scan_root.rglob("*"):
+            if not path.is_file() or path.suffix not in scanned_suffixes:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if live in text:
+                offenders.append(str(path.relative_to(root)))
+
+    assert not offenders, f"真实邀请码出现在会被提交的文件里：{offenders}"
