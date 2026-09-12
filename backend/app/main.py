@@ -63,6 +63,12 @@ async def lifespan(_: FastAPI):
     except Exception as exc:  # pragma: no cover - 取决于部署环境
         # 建表失败必须可见，但不能挡住整个服务：基金数据接口仍可读。
         print(f"[startup] 认证表初始化失败：{exc}", file=sys.stderr)
+    # 邀请码只在这里出现一次，方便把码抄给被邀请的人；
+    # `/api/auth/policy` 永远不回显它，否则等于公开挂在墙上。
+    try:
+        print(f"[startup] {auth_module.describe_invite_policy()}", file=sys.stderr)
+    except Exception as exc:  # pragma: no cover - 取决于部署环境
+        print(f"[startup] 邀请码策略读取失败：{exc}", file=sys.stderr)
     warmup = asyncio.create_task(_warm_up())
     try:
         yield
@@ -235,6 +241,8 @@ class RegisterRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=1, max_length=200)
     displayName: str = Field(default="", max_length=80)
+    # 默认空串：处于开放注册的部署可以不带这个字段。
+    inviteCode: str = Field(default="", max_length=200)
 
 
 class LoginRequest(BaseModel):
@@ -259,6 +267,11 @@ def _session_payload(user: UserRecord) -> dict[str, Any]:
 @app.post("/api/auth/register", status_code=201)
 async def register(request: RegisterRequest) -> dict[str, Any]:
     """注册并直接返回登录态。口令强度由 security 层统一校验。"""
+    # 邀请码放在最前面。没通过准入的请求不会进建号逻辑：既省下 PBKDF2 的
+    # 24 万次迭代，也避免用 409 告诉对方「这个邮箱已经注册过」。
+    if not auth_module.verify_invite_code(request.inviteCode):
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_INVITE_CODE", "message": "邀请码不正确"})
     try:
         user = await auth_module.create_user(request.email, request.password, request.displayName)
     except EmailAlreadyRegistered as exc:
@@ -281,6 +294,16 @@ async def login(request: LoginRequest) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail={
             "code": "INVALID_CREDENTIALS", "message": "邮箱或密码不正确"})
     return _session_payload(user)
+
+
+@app.get("/api/auth/policy")
+async def auth_policy() -> dict[str, Any]:
+    """登录/注册页需要的公开信息。
+
+    只回答「要不要邀请码」，不带码本身、也不带码的长度——这个端点不需要
+    登录就能访问，泄露任何一位都会缩短爆破空间。
+    """
+    return auth_module.invite_policy()
 
 
 @app.get("/api/auth/me")
@@ -333,7 +356,7 @@ async def remove_conversation(
 
 
 @app.get("/api/ai/status")
-async def ai_status() -> dict[str, Any]:
+async def ai_status(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     return llm_service.status()
 
 
@@ -343,12 +366,14 @@ class KnowledgeSearchRequest(BaseModel):
 
 
 @app.get("/api/knowledge/status")
-async def knowledge_status() -> dict[str, Any]:
+async def knowledge_status(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     return knowledge_base.status()
 
 
 @app.post("/api/knowledge/search")
-async def knowledge_search(request: KnowledgeSearchRequest) -> dict[str, Any]:
+async def knowledge_search(
+    request: KnowledgeSearchRequest, user: UserRecord = Depends(current_user)
+) -> dict[str, Any]:
     items = await knowledge_base.search(request.query, request.limit)
     return {"items": [item.__dict__ for item in items], "status": knowledge_base.status()}
 
@@ -364,14 +389,14 @@ async def reset_ai() -> Any:
 
 
 @app.get("/api/funds")
-async def funds() -> dict[str, Any]:
+async def funds(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     require_production_data()
     await repository.ensure_funds()
     return envelope([fund.as_dict() for fund in repository.list_funds()])
 
 
 @app.get("/api/funds/{code}")
-async def fund_detail(code: str) -> dict[str, Any]:
+async def fund_detail(code: str, user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     require_production_data()
     await repository.ensure_funds()
     fund = repository.get_fund(code)
@@ -381,7 +406,7 @@ async def fund_detail(code: str) -> dict[str, Any]:
 
 
 @app.get("/api/funds/{code}/data-quality")
-async def fund_quality(code: str) -> dict[str, Any]:
+async def fund_quality(code: str, user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     require_production_data()
     await repository.ensure_funds()
     fund = repository.get_fund(code)
@@ -396,7 +421,9 @@ async def fund_quality(code: str) -> dict[str, Any]:
 
 
 @app.get("/api/funds/{code}/history")
-async def fund_history(code: str, period: str = "1年") -> dict[str, Any]:
+async def fund_history(
+    code: str, period: str = "1年", user: UserRecord = Depends(current_user)
+) -> dict[str, Any]:
     require_production_data()
     await repository.ensure_funds()
     fund = repository.get_fund(code)
@@ -416,14 +443,18 @@ async def fund_history(code: str, period: str = "1年") -> dict[str, Any]:
 
 
 @app.post("/api/funds/screen")
-async def screen(request: ScreenRequest) -> dict[str, Any]:
+async def screen(
+    request: ScreenRequest, user: UserRecord = Depends(current_user)
+) -> dict[str, Any]:
     require_production_data()
     await repository.ensure_funds()
     return envelope([item.as_dict() for item in filtered(request)])
 
 
 @app.post("/api/funds/compare")
-async def compare(payload: dict[str, Any]) -> dict[str, Any]:
+async def compare(
+    payload: dict[str, Any], user: UserRecord = Depends(current_user)
+) -> dict[str, Any]:
     require_production_data()
     await repository.ensure_funds()
     codes = payload.get("codes", [])
@@ -540,7 +571,7 @@ async def get_events(run_id: str, user: UserRecord = Depends(current_user)) -> d
 
 
 @app.get("/api/market/etf-quotes")
-async def market_quotes() -> dict[str, Any]:
+async def market_quotes(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     status = provider.status.as_dict()
     items = await provider.etf_quotes()
     status = provider.status.as_dict()
@@ -549,17 +580,17 @@ async def market_quotes() -> dict[str, Any]:
 
 
 @app.post("/api/market/etf-quotes/refresh")
-async def refresh_market_quotes() -> dict[str, Any]:
-    return await market_quotes()
+async def refresh_market_quotes(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+    return await market_quotes(user)
 
 
 @app.get("/api/data-sources/status")
-async def data_sources() -> dict[str, Any]:
+async def data_sources(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     return {"items": [provider.status.as_dict()], "mode": MODE, "nav": provider.status.as_dict()}
 
 
 @app.post("/api/data/funds/refresh")
-async def refresh_funds() -> dict[str, Any]:
+async def refresh_funds(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     require_public_write()
     updated = await repository.refresh_funds()
     return {"updated": updated, "status": provider.status.as_dict(), "count": len(repository.funds),
@@ -590,7 +621,7 @@ async def remove_watch(code: str, user: UserRecord = Depends(current_user)) -> N
 
 
 @app.get("/api/profile/risk")
-async def get_profile() -> dict[str, Any]:
+async def get_profile(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     return {"riskLevel": "中高风险", "investmentHorizonMonths": 36, "liquidityNeed": "低", "goalType": "长期积累",
             "confirmedAt": datetime.now(timezone.utc).isoformat(), "questionnaireVersion": "risk-questionnaire-v1"}
 

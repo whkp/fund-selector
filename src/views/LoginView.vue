@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { ArrowRight, Check, Compass, Lock, Mail, RefreshCw, ShieldCheck, User } from 'lucide-vue-next'
-import { login, register, type AuthUser } from '../services/auth'
+import { computed, onMounted, ref } from 'vue'
+import { ArrowRight, Check, Compass, Lock, Mail, RefreshCw, ShieldCheck, Ticket, User } from 'lucide-vue-next'
+import { fetchAuthPolicy, login, register, type AuthUser } from '../services/auth'
 import { ApiError } from '../services/http'
 
 const emit = defineEmits<{ authenticated: [AuthUser] }>()
@@ -11,14 +11,29 @@ const email = ref('')
 const password = ref('')
 const confirmPassword = ref('')
 const displayName = ref('')
+const inviteCode = ref('')
 const isSubmitting = ref(false)
 const errorMessage = ref('')
+
+// 默认按「需要邀请码」渲染。真实策略由 /auth/policy 决定，但万一那个请求
+// 失败，宁可多显示一个输入框，也不要让界面把一个受控入口画成敞开的。
+const inviteRequired = ref(true)
 
 const isRegister = computed(() => mode.value === 'register')
 const canSubmit = computed(() => {
   if (!email.value.trim() || !password.value) return false
   if (isRegister.value && password.value !== confirmPassword.value) return false
+  if (isRegister.value && inviteRequired.value && !inviteCode.value.trim()) return false
   return true
+})
+
+onMounted(async () => {
+  try {
+    const policy = await fetchAuthPolicy()
+    inviteRequired.value = policy.inviteRequired
+  } catch {
+    /* 保持保守默认值，不做任何提示：这只是展示层的优化。 */
+  }
 })
 
 function switchMode(next: 'login' | 'register') {
@@ -36,7 +51,7 @@ async function submit() {
   isSubmitting.value = true
   try {
     const user = isRegister.value
-      ? await register(email.value.trim(), password.value, displayName.value.trim())
+      ? await register(email.value.trim(), password.value, displayName.value.trim(), inviteCode.value.trim())
       : await login(email.value.trim(), password.value)
     emit('authenticated', user)
   } catch (error) {
@@ -78,9 +93,13 @@ async function submit() {
         </div>
 
         <h2>{{ isRegister ? '创建你的账号' : '欢迎回来' }}</h2>
-        <p class="auth-hint">{{ isRegister ? '注册后即可保存自选与研究记录。' : '输入邮箱与密码继续。' }}</p>
+        <p class="auth-hint">{{ isRegister ? (inviteRequired ? '本系统为邀请制，注册需要邀请码。' : '注册后即可保存自选与研究记录。') : '输入邮箱与密码继续。' }}</p>
 
         <form @submit.prevent="submit">
+          <label v-if="isRegister && inviteRequired">
+            <span>邀请码</span>
+            <div class="field"><Ticket :size="16" /><input v-model.trim="inviteCode" type="text" autocomplete="off" spellcheck="false" placeholder="向邀请你的人索取" required /></div>
+          </label>
           <label v-if="isRegister">
             <span>称呼</span>
             <div class="field"><User :size="16" /><input v-model.trim="displayName" type="text" autocomplete="name" placeholder="选填，用于界面显示" /></div>

@@ -20,6 +20,9 @@ os.environ["FUND_COMPASS_DATABASE_URL"] = f"sqlite+aiosqlite:///{_DB_PATH}"
 os.environ["FUND_COMPASS_AKSHARE_ENABLED"] = "false"
 os.environ["FUND_COMPASS_MODE"] = "REFERENCE"
 os.environ["FUND_COMPASS_JWT_SECRET"] = "test-secret-not-for-production"
+# 固定一个已知邀请码：注册类用例需要它，而「邀请码关卡」本身也必须有确定的
+# 期望值。不设的话会走「自动生成并落盘」分支，测试结果就依赖磁盘上残留的文件。
+os.environ["FUND_COMPASS_INVITE_CODE"] = "test-invite-code"
 
 import pytest  # noqa: E402
 

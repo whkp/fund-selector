@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import uuid
 
 import pytest
@@ -24,6 +25,9 @@ from app.security import (
 
 client = TestClient(app)
 SECRET = "test-secret-not-for-production"
+# 由 conftest 固定注入，见 tests/conftest.py。注册用例必须带上它，
+# 否则会停在邀请码这一关，测不到后面的口令/邮箱校验。
+INVITE_CODE = os.environ["FUND_COMPASS_INVITE_CODE"]
 
 
 def unique_email() -> str:
@@ -104,6 +108,7 @@ def test_register_returns_a_usable_session():
     email = unique_email()
     response = client.post("/api/auth/register", json={
         "email": email, "password": "test-password-123", "displayName": "何总",
+        "inviteCode": INVITE_CODE,
     })
     assert response.status_code == 201, response.text
     body = response.json()
@@ -119,7 +124,7 @@ def test_register_returns_a_usable_session():
 
 def test_register_rejects_duplicate_email():
     email = unique_email()
-    payload = {"email": email, "password": "test-password-123"}
+    payload = {"email": email, "password": "test-password-123", "inviteCode": INVITE_CODE}
     assert client.post("/api/auth/register", json=payload).status_code == 201
     duplicate = client.post("/api/auth/register", json=payload)
     assert duplicate.status_code == 409
@@ -127,17 +132,20 @@ def test_register_rejects_duplicate_email():
 
 
 def test_register_rejects_weak_password_and_bad_email():
-    weak = client.post("/api/auth/register", json={"email": unique_email(), "password": "123"})
+    weak = client.post("/api/auth/register", json={
+        "email": unique_email(), "password": "123", "inviteCode": INVITE_CODE})
     assert weak.status_code == 400
     assert weak.json()["detail"]["code"] == "WEAK_PASSWORD"
-    bad = client.post("/api/auth/register", json={"email": "not-an-email", "password": "test-password-123"})
+    bad = client.post("/api/auth/register", json={
+        "email": "not-an-email", "password": "test-password-123", "inviteCode": INVITE_CODE})
     assert bad.status_code == 400
     assert bad.json()["detail"]["code"] == "INVALID_EMAIL"
 
 
 def test_login_does_not_leak_whether_account_exists():
     email = unique_email()
-    client.post("/api/auth/register", json={"email": email, "password": "test-password-123"})
+    client.post("/api/auth/register", json={
+        "email": email, "password": "test-password-123", "inviteCode": INVITE_CODE})
 
     ok = client.post("/api/auth/login", json={"email": email, "password": "test-password-123"})
     assert ok.status_code == 200
@@ -154,7 +162,7 @@ def test_me_and_logout_require_a_valid_token():
     assert client.post("/api/auth/logout").status_code == 401
 
     token = client.post("/api/auth/register", json={
-        "email": unique_email(), "password": "test-password-123",
+        "email": unique_email(), "password": "test-password-123", "inviteCode": INVITE_CODE,
     }).json()["token"]
     headers = {"Authorization": f"Bearer {token}"}
     assert client.post("/api/auth/logout", headers=headers).status_code == 204
@@ -162,7 +170,8 @@ def test_me_and_logout_require_a_valid_token():
 
 def test_login_is_case_insensitive_on_email():
     email = unique_email()
-    client.post("/api/auth/register", json={"email": email, "password": "test-password-123"})
+    client.post("/api/auth/register", json={
+        "email": email, "password": "test-password-123", "inviteCode": INVITE_CODE})
     response = client.post("/api/auth/login", json={
         "email": email.upper(), "password": "test-password-123",
     })
@@ -177,6 +186,7 @@ def register_headers(prefix: str = "cnv") -> dict[str, str]:
     token = client.post("/api/auth/register", json={
         "email": f"{prefix}_{uuid.uuid4().hex[:10]}@example.com",
         "password": "test-password-123",
+        "inviteCode": INVITE_CODE,
     }).json()["token"]
     return {"Authorization": f"Bearer {token}"}
 

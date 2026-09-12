@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import re
+import secrets
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +26,7 @@ from .security import (
     hash_password,
     issue_token,
     load_or_create_secret,
+    match_invite_code,
     normalize_email,
     validate_password,
     verify_password,
@@ -31,7 +34,15 @@ from .security import (
 
 DEFAULT_TOKEN_TTL_SECONDS = 30 * 24 * 3600
 DEFAULT_SECRET_FILE = Path(__file__).resolve().parents[1] / "data" / ".jwt-secret"
+DEFAULT_INVITE_FILE = Path(__file__).resolve().parents[1] / "data" / ".invite-code"
 MAX_TITLE_LENGTH = 120
+
+# 把 `security.invite_code` 显式配成这些值之一，表示「开放注册、不校验邀请码」。
+OPEN_REGISTRATION_TOKENS = frozenset({"off", "open", "none", "disabled", "*"})
+
+# `config_value` 的默认值哨兵：用来区分「配置里根本没写这个键」和
+# 「写了但值是空/null」。只有前者才走自动生成，后者是显式意图。
+_UNSET = object()
 
 
 class EmailAlreadyRegistered(Exception):
@@ -71,6 +82,105 @@ def jwt_secret() -> str:
     if not path.is_absolute():
         path = Path(__file__).resolve().parents[1] / path
     return load_or_create_secret(path)
+
+
+def _invite_code_file() -> Path:
+    raw = str(config_value(
+        "security", "invite_code_file", str(DEFAULT_INVITE_FILE),
+        env_name="FUND_COMPASS_INVITE_CODE_FILE",
+    )).strip()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        # 相对路径按 backend/ 解析，和 .jwt-secret、sqlite 文件保持一致。
+        path = Path(__file__).resolve().parents[1] / path
+    return path
+
+
+def _split_invite_codes(raw: str) -> list[str]:
+    """逗号 / 分号 / 换行分隔，便于一次配多个码分批发给不同的人。"""
+    return [part.strip() for part in re.split(r"[,\n;]+", raw) if part.strip()]
+
+
+def _load_or_create_invite_codes() -> list[str]:
+    """未显式配置时的兜底：从数据目录读邀请码，没有就生成一个。
+
+    与 JWT 密钥同理，邀请码必须落盘。只放内存里的话进程每次重启都会换码，
+    已经发出去的邀请码会集体作废。
+    """
+    path = _invite_code_file()
+    try:
+        if path.exists():
+            existing = path.read_text(encoding="utf-8").strip()
+            if existing:
+                return _split_invite_codes(existing)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # token_urlsafe(12) 约 16 字符 / 96 bit 熵：字典攻击不现实，
+        # 长度又短到能从启动日志里手抄给别人。
+        value = secrets.token_urlsafe(12)
+        path.write_text(value + "\n", encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return [value]
+    except OSError:
+        # 只读文件系统等极端情况：本次运行依然封闭，只是重启后会换码。
+        return [secrets.token_urlsafe(12)]
+
+
+def _active_invite_codes() -> list[str]:
+    """当前生效的邀请码集合。**空列表 = 开放注册，完全不校验。**
+
+    区分点在「有没有显式配置」，而不是值本身：
+
+    - 未配置（或配成 null）→ 生成/读取磁盘上的随机码，默认即封闭
+    - 显式配空、或 off/open/none/disabled/* → 开放注册
+    - 配了具体值 → 必须命中其中之一
+    """
+    configured = config_value(
+        "security", "invite_code", _UNSET, env_name="FUND_COMPASS_INVITE_CODE",
+    )
+    if configured is _UNSET or configured is None:
+        return _load_or_create_invite_codes()
+    text = str(configured).strip()
+    if not text or text.lower() in OPEN_REGISTRATION_TOKENS:
+        return []
+    return _split_invite_codes(text)
+
+
+def invite_policy() -> dict[str, Any]:
+    """注册准入策略的公开视图。
+
+    这个结果会经 `/api/auth/policy` 发给**未登录访客**，所以只说明「要不要
+    邀请码」，绝不带码本身，也不暴露码的长度。
+    """
+    codes = _active_invite_codes()
+    return {"inviteRequired": bool(codes), "inviteCodeCount": len(codes)}
+
+
+def verify_invite_code(provided: str) -> bool:
+    """注册入口的准入判断。处于开放注册状态时恒为 True。"""
+    codes = _active_invite_codes()
+    if not codes:
+        return True
+    return match_invite_code(provided, codes)
+
+
+def describe_invite_policy() -> str:
+    """启动日志用的一行摘要，方便随时把码抄给要邀请的人。"""
+    codes = _active_invite_codes()
+    if not codes:
+        return "registration is OPEN - no invite code required"
+    return "registration requires invite code: " + ", ".join(codes)
+
+
+def active_invite_codes() -> list[str]:
+    """当前生效的邀请码明文，**仅供本地运维脚本打印**。
+
+    刻意不做成 `invite_policy()` 的一部分：那个结果会经 `/api/auth/policy`
+    发给未登录访客。任何把本函数接进 HTTP 响应的地方，都会让邀请制当场失效。
+    """
+    return list(_active_invite_codes())
 
 
 def _patch_legacy_users_table(sync_connection: Any) -> None:
@@ -398,6 +508,7 @@ async def find_message_by_run(user_id: str, run_id: str) -> dict[str, Any] | Non
 __all__ = [
     "ConversationNotFound",
     "EmailAlreadyRegistered",
+    "active_invite_codes",
     "append_message",
     "authenticate",
     "conversation_for_run",
@@ -405,10 +516,12 @@ __all__ = [
     "create_user",
     "current_user",
     "delete_conversation",
+    "describe_invite_policy",
     "ensure_auth_schema",
     "find_message_by_run",
     "get_conversation",
     "get_user",
+    "invite_policy",
     "issue_session_token",
     "jwt_secret",
     "list_conversations",
@@ -416,4 +529,5 @@ __all__ = [
     "optional_user",
     "token_ttl_seconds",
     "user_public",
+    "verify_invite_code",
 ]

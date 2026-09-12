@@ -17,6 +17,7 @@ import json
 import re
 import secrets
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -193,3 +194,45 @@ def load_or_create_secret(path: Path) -> str:
     except OSError:
         # 只读文件系统等极端情况下退回进程内密钥：本次运行可用，重启后需重新登录。
         return secrets.token_urlsafe(48)
+
+
+# ---------------------------------------------------------------------------
+# 邀请码
+# ---------------------------------------------------------------------------
+
+MAX_INVITE_CODE_LENGTH = 200
+
+
+def normalize_invite_code(raw: str) -> str:
+    """归一化邀请码，容忍粘贴时带入的空白、分隔符与大小写差异。
+
+    邀请码主要靠聊天工具口头或截图传递，很容易带上首尾空格，或者被自动
+    排版成 `abcd-efgh` 这种分组写法。归一化之后再比对，能消除掉一大类
+    「码明明是对的却进不去」的挫败感，且不牺牲任何强度。
+    """
+    if not isinstance(raw, str):
+        return ""
+    return re.sub(r"[\s\-_]+", "", raw).lower()
+
+
+def match_invite_code(provided: str, expected: Iterable[str]) -> bool:
+    """恒定时间比对邀请码。
+
+    两个刻意的取舍：
+
+    - 用 UTF-8 bytes 而不是 str 调 `hmac.compare_digest`。后者对 str 只接受
+      ASCII 字符，邀请码里一旦出现中文会直接抛 TypeError。
+    - 循环里不提前 return。命中即跳出会让响应时间随「匹配到的位置」变化，
+      等于把邀请码逐位泄露出去。
+    """
+    candidate = normalize_invite_code(provided)
+    if not candidate:
+        return False
+    matched = False
+    for item in expected:
+        target = normalize_invite_code(item)
+        if not target:
+            continue
+        if hmac.compare_digest(candidate.encode("utf-8"), target.encode("utf-8")):
+            matched = True
+    return matched

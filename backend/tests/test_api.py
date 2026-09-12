@@ -56,6 +56,9 @@ def reset_repository(monkeypatch: pytest.MonkeyPatch) -> None:
 
 client = TestClient(app)
 
+# 由 conftest 固定注入，见 tests/conftest.py。
+INVITE_CODE = os.environ["FUND_COMPASS_INVITE_CODE"]
+
 
 def register_user(prefix: str = "tester") -> dict[str, str]:
     """注册一个随机邮箱的用户，返回可直接用于请求的 Authorization 头。"""
@@ -63,6 +66,7 @@ def register_user(prefix: str = "tester") -> dict[str, str]:
         "email": f"{prefix}_{uuid.uuid4().hex[:10]}@example.com",
         "password": "test-password-123",
         "displayName": "测试用户",
+        "inviteCode": INVITE_CODE,
     })
     assert response.status_code == 201, response.text
     return {"Authorization": f"Bearer {response.json()['token']}"}
@@ -77,7 +81,7 @@ def test_health_exposes_python_api_and_reference_mode():
 
 
 def test_funds_are_compatible_with_vue_contract():
-    response = client.get("/api/funds")
+    response = client.get("/api/funds", headers=register_user())
     assert response.status_code == 200
     body = response.json()
     assert len(body["items"]) == 5
@@ -91,7 +95,7 @@ def test_screen_preserves_unknown_fields_for_reference_research():
     response = client.post("/api/funds/screen", json={
         "query": "新能源", "limit": 10,
         "filters": {"riskLevelMax": "中高风险", "maxFee": 1.2, "requireOpen": True},
-    })
+    }, headers=register_user())
     assert response.status_code == 200
     codes = [item["code"] for item in response.json()["items"]]
     assert codes == ["008286", "012349", "012861"]
@@ -197,7 +201,11 @@ def test_watchlist_is_isolated_between_users():
 
 
 def test_compare_rejects_more_than_four_funds():
-    response = client.post("/api/funds/compare", json={"codes": ["008286", "012349", "012861", "004640", "017327"]})
+    response = client.post(
+        "/api/funds/compare",
+        json={"codes": ["008286", "012349", "012861", "004640", "017327"]},
+        headers=register_user(),
+    )
     assert response.status_code == 400
 
 
@@ -212,13 +220,13 @@ def test_anonymous_write_requires_login():
 def test_production_mode_requires_a_production_data_source(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(main_module, "MODE", "PRODUCTION")
     monkeypatch.setattr(main_module, "PRODUCTION_DATA_READY", False)
-    response = client.get("/api/funds")
+    response = client.get("/api/funds", headers=register_user())
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "PRODUCTION_DATA_NOT_READY"
 
 
 def test_history_endpoint_is_explicit_when_provider_is_unavailable():
-    response = client.get("/api/funds/008286/history")
+    response = client.get("/api/funds/008286/history", headers=register_user())
     assert response.status_code == 200
     body = response.json()
     assert body["fundCode"] == "008286"

@@ -9,6 +9,12 @@ export type AuthUser = {
   lastLoginAt: string | null
 }
 
+/** 公开的注册准入策略。刻意不含邀请码本身，这个接口不需要登录即可访问。 */
+export type AuthPolicy = {
+  inviteRequired: boolean
+  inviteCodeCount: number
+}
+
 export type Conversation = {
   id: string
   title: string
@@ -39,13 +45,23 @@ export async function login(email: string, password: string): Promise<AuthUser> 
   return session.user
 }
 
-export async function register(email: string, password: string, displayName = ''): Promise<AuthUser> {
+export async function register(
+  email: string,
+  password: string,
+  displayName = '',
+  inviteCode = '',
+): Promise<AuthUser> {
   const session = await request<SessionResponse>('/auth/register', {
     method: 'POST',
-    body: JSON.stringify({ email, password, displayName }),
+    body: JSON.stringify({ email, password, displayName, inviteCode }),
   })
   setToken(session.token)
   return session.user
+}
+
+/** 拉取注册准入策略，让登录页自己决定要不要显示邀请码输入框。 */
+export async function fetchAuthPolicy(): Promise<AuthPolicy> {
+  return request<AuthPolicy>('/auth/policy')
 }
 
 /** 用已保存的令牌换取当前用户。令牌无效时返回 null，由调用方决定是否跳登录页。 */
