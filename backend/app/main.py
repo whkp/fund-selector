@@ -6,11 +6,13 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import config_value
@@ -444,3 +446,17 @@ async def remove_watch(code: str) -> None:
 async def get_profile() -> dict[str, Any]:
     return {"riskLevel": "中高风险", "investmentHorizonMonths": 36, "liquidityNeed": "低", "goalType": "长期积累",
             "confirmedAt": datetime.now(timezone.utc).isoformat(), "questionnaireVersion": "risk-questionnaire-v1"}
+
+
+# ---------------------------------------------------------------------------
+# Same-origin static frontend
+# ---------------------------------------------------------------------------
+# When a Vite build sits next to the backend, serve it from this same app so a
+# single process answers both the API and the UI. That keeps the browser on one
+# origin (no CORS negotiation) and lets a single tunnel expose a single port.
+# Registered last so every /api and operational route declared above wins the
+# match; StaticFiles only sees what nothing else claimed. Deployments that ship
+# without a build (Render, containers) simply skip the mount and behave as before.
+_frontend_dir = Path(__file__).resolve().parents[2] / "dist"
+if _frontend_dir.is_dir():
+    app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")

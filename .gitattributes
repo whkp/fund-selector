@@ -5,5 +5,9 @@
 Dockerfile text eol=lf
 .dockerignore text eol=lf
 
+# Windows 批处理必须在 Windows 上以 CRLF 检出，否则 goto/label 解析会出问题。
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
 # 其余文本文件交给 git 自动判定行尾，Windows 检出为 CRLF 不影响使用。
 * text=auto

@@ -8,6 +8,7 @@ __pycache__/
 .env
 coverage.out
 *.log
+logs/
 config/fund-compass.json
 config/*.local.json
 data/
