@@ -81,3 +81,29 @@ button { cursor: pointer; }
 @media (max-width: 720px) { .topbar { height: 57px; padding: 0 16px; }.content-scroll { min-height: calc(100vh - 57px); padding: 24px 15px 32px; }.breadcrumb span, .breadcrumb svg { display: none; }.top-actions { gap: 8px; }.data-chip { display: none; }.title-row { align-items: flex-end; margin-bottom: 20px; }.title-row h1 { font-size: 22px; }.trace-button { padding: 8px; font-size: 0; }.trace-button svg { width: 17px; height: 17px; }.query-panel { padding: 16px 14px 13px; }.query-input-row { flex-direction: column; gap: 5px; }.query-input-row textarea { min-height: 72px; font-size: 14px; }.query-input-row .run-button { align-self: stretch; }.research-grid { display: block; margin-top: 17px; }.filter-panel { margin-bottom: 16px; }.filter-panel { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 12px; }.section-caption, .filter-foot { grid-column: 1 / -1; }.filter-options { grid-column: 1 / -1; }.filter-options button { flex: 1; }.filter-label { margin-top: 14px; }.toggle-row { grid-column: 1 / -1; }.filter-foot { margin-top: 14px; }.results-header { margin-top: 24px; }.fund-card { display: grid; grid-template-columns: 32px 1fr 50px; gap: 9px; min-height: auto; padding: 14px 11px 39px; }.fund-main { grid-column: 2 / 4; }.rank-col { grid-column: 1; grid-row: 1; }.fund-stats { grid-column: 2; grid-row: 2; display: flex; gap: 17px; padding: 0; border: 0; }.fund-score { grid-column: 3; grid-row: 1; align-self: start; }.fund-score strong { font-size: 21px; }.fund-metadata { gap: 7px; }.card-actions { right: 9px; bottom: 6px; }.insight-rail { display: grid; grid-template-columns: 1fr; margin-top: 17px; }.compass-card { display: block; }.compass-viz { margin: 15px auto; }.notice-card { grid-column: auto; }.results-note { margin-bottom: 8px; }.method-bar { align-items: flex-start; font-size: 10px; line-height: 1.5; }.comparison-table { margin: 0 -15px; border-radius: 0; }.market-status-bar { grid-template-columns: auto minmax(0, 1fr); align-items: start; }.market-status-bar small { grid-column: 2; }.market-quote-panel { margin: 0 -15px; border-right: 0; border-left: 0; border-radius: 0; }.market-boundary { grid-template-columns: 1fr; }.market-boundary > div { min-height: auto; border-right: 0; border-bottom: 1px solid #e5ece8; }.market-boundary > div:last-child { border-bottom: 0; }.watchlist-module { grid-template-columns: 1fr; }.detail-drawer { padding: 20px 16px; }.detail-drawer h2 { font-size: 20px; }.drawer-score-row { grid-template-columns: 97px 1fr; gap: 12px; }.metric-grid { grid-template-columns: repeat(2, 1fr); }.trace-overlay { padding: 15px; }.trace-modal { padding: 20px 16px; }.trace-data { grid-template-columns: 1fr; }.trace-data > div, .trace-data > div:nth-child(odd) { border-right: 0; border-bottom: 1px solid #e9efeb; }.trace-data > div:last-child { border-bottom: 0; } }
 @media (max-width: 390px) { .fund-card { grid-template-columns: 27px 1fr 46px; }.fund-title-line h3 { font-size: 14px; }.fund-name { max-width: 220px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }.fund-metadata { font-size: 8px; }.understanding-row { gap: 5px; }.understanding-chip { font-size: 10px; }.filter-panel { grid-template-columns: 1fr; }.filter-panel .filter-options, .filter-panel .section-caption, .filter-panel .toggle-row, .filter-panel .filter-foot { grid-column: auto; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; transition-duration: .001ms !important; } }
+
+/* 登录门禁：确认令牌期间的中转态 */
+.auth-boot { display: flex; align-items: center; justify-content: center; gap: 9px; min-height: 100vh; color: #6b807d; font-size: 13px; background: #f7f7f2; }
+.auth-boot-spin { color: #1d6b68; animation: spin .8s linear infinite; }
+
+/* 侧边栏账号卡：退出按钮 */
+.user-card .sign-out { margin-left: auto; width: 28px; height: 28px; color: #7faaa3; }
+.user-card .sign-out:hover { color: #f0c56a; background: rgba(240, 197, 106, .12); border-color: rgba(240, 197, 106, .3); }
+
+/* 复盘日志：历史对话 */
+.conversation-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(276px, 1fr)); gap: 12px; }
+.conversation-card { display: flex; align-items: center; gap: 8px; padding: 14px 15px; background: #fff; border: 1px solid #dfe7e2; border-radius: 6px; transition: border-color .16s ease, box-shadow .16s ease; }
+.conversation-card:hover { border-color: #a9c8bf; box-shadow: 0 8px 19px rgba(24, 70, 65, .07); }
+.conversation-card.active { border-color: #1d6b68; box-shadow: inset 3px 0 #f0c56a; }
+.conversation-main { flex: 1; min-width: 0; padding: 0; text-align: left; background: none; border: 0; }
+.conversation-main h3 { margin: 0; overflow: hidden; color: #18353a; font-size: 13px; font-weight: 700; white-space: nowrap; text-overflow: ellipsis; }
+.conversation-main p { margin: 6px 0 0; color: #81918e; font-family: 'IBM Plex Mono', monospace; font-size: 10px; }
+.conversation-card .icon-button:hover { color: #9a5d43; background: #f9eee8; border-color: #f0d9cc; }
+.conversation-thread { display: grid; gap: 11px; margin-top: 20px; padding: 18px; background: #fff; border: 1px solid #dce6e1; border-radius: 6px; }
+.thread-loading { margin: 0; color: #81918e; font-size: 12px; }
+.thread-message { padding: 12px 14px; background: #f9fbf9; border: 1px solid #e4ece7; border-radius: 5px; }
+.thread-message.user { border-left: 3px solid #1d6b68; }
+.thread-message.assistant { background: #fffdf7; border-left: 3px solid #d49a38; }
+.thread-role { display: block; color: #5d8581; font-family: 'IBM Plex Mono', monospace; font-size: 10px; letter-spacing: .05em; }
+.thread-message p { margin: 7px 0 0; color: #3a5755; font-size: 12.5px; line-height: 1.75; white-space: pre-wrap; }
+.thread-message small { display: block; margin-top: 8px; color: #98a39f; font-family: 'IBM Plex Mono', monospace; font-size: 9px; }

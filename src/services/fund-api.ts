@@ -1,14 +1,12 @@
 import type { Fund } from '../types'
-
-// `||` not `??`: an unset VITE_API_BASE resolves to "" rather than null/undefined,
-// so `??` would let the empty string through and every request would hit the static host.
-const apiBase = import.meta.env.VITE_API_BASE || '/api'
+import { request } from './http'
 
 export type ResearchRun = {
   runId: string
   status: string
   mode: string
   modelVersion: string
+  conversationId?: string
   interpretation: { provider: string; status: string; intent?: string; themes?: string[]; ambiguities?: string[] }
   summary: string
   knowledgeRefs: Array<{ chunk_id: string; title: string; source: string }>
@@ -75,20 +73,6 @@ export type MarketQuoteResponse = {
 type FundListResponse = { items: Fund[] }
 type WatchlistResponse = { items: Array<{ fund: Fund }> }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${apiBase}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
-    ...init,
-  })
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null) as { error?: { message?: string } } | null
-    const detail = payload?.error?.message ?? (payload as { detail?: { message?: string } } | null)?.detail?.message
-    throw new Error(detail ?? `API request failed (${response.status})`)
-  }
-  if (response.status === 204) return undefined as T
-  return response.json() as Promise<T>
-}
-
 export async function fetchFunds(): Promise<Fund[]> {
   const payload = await request<FundListResponse>('/funds')
   return payload.items
@@ -120,12 +104,15 @@ export async function createResearchRun(query: string, maxFee: number, riskLevel
   requireOpen?: boolean
   minimumInceptionYears?: number
   llm?: SessionLLMConfig
+  /** 传入已存在的对话 ID 即为「追问」，留空则由服务端新建一个对话。 */
+  conversationId?: string
 }): Promise<ResearchRun> {
   return request<ResearchRun>('/recommendations/runs', {
     method: 'POST',
     body: JSON.stringify({
       query,
       limit: 10,
+      conversationId: options?.conversationId ?? '',
       filters: {
         riskLevelMax,
         maxFee,

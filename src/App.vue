@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   Activity, ArrowDownUp, ArrowUpRight, BarChart3, BellRing, Bot, CalendarClock,
   Check, ChevronDown, ChevronRight, CircleAlert, Clock3, Compass, Database,
-  FileSearch, Filter, Info, Landmark, LineChart, ListFilter, Menu, MoreHorizontal,
+  FileSearch, Filter, Info, Landmark, LineChart, ListFilter, LogOut, Menu, MoreHorizontal,
   Plus, Radio, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Star, X
 } from 'lucide-vue-next'
 import type { Fund } from './types'
@@ -12,6 +12,12 @@ import {
   refreshMarketQuotes, removeWatchlistItem, type MarketQuote, type MarketQuoteResponse,
   type AIStatus, type FundHistoryResponse, type MarketSourceStatus, type ResearchRun, type SessionLLMConfig
 } from './services/fund-api'
+import LoginView from './views/LoginView.vue'
+import {
+  deleteConversation, fetchConversation, fetchConversations, fetchMe,
+  logout as logoutSession, type AuthUser, type Conversation, type ConversationMessage,
+} from './services/auth'
+import { onUnauthorized } from './services/http'
 
 const activeNav = ref('基金筛选')
 const query = ref('准备定投 3 年，关注新能源和高端制造，但不希望波动太大，费用尽量低。')
@@ -47,6 +53,15 @@ const isMarketRefreshing = ref(false)
 const isMarketLoading = ref(false)
 let marketTimer: number | undefined
 
+// 登录态。authReady 为 false 时先确认令牌，避免闪一下主界面再跳回登录页。
+const authReady = ref(false)
+const currentUser = ref<AuthUser | null>(null)
+// 复盘日志：当前账号的历史对话
+const conversations = ref<Conversation[]>([])
+const conversationMessages = ref<ConversationMessage[]>([])
+const activeConversationId = ref('')
+const conversationLoading = ref(false)
+
 const navigation = [
   { label: '基金筛选', icon: Compass }, { label: '实时行情', icon: LineChart }, { label: '对比台', icon: ArrowDownUp },
   { label: '我的观察', icon: Star }, { label: '目标与风险', icon: SlidersHorizontal },
@@ -80,6 +95,9 @@ const aiModeLabel = computed(() => {
   return `${aiStatus.value.provider} · ${aiStatus.value.model}`
 })
 const hasSessionLLM = computed(() => Boolean(sessionLLM.value.apiKey.trim()))
+const userInitial = computed(() =>
+  (currentUser.value?.displayName || currentUser.value?.email || '?').trim().slice(0, 1).toUpperCase()
+)
 const marketAsOf = computed(() => marketStatus.value?.lastSuccessAt ? formatTime(marketStatus.value.lastSuccessAt) : '尚无成功快照')
 const dataModeLabel = computed(() => {
   const fund = availableFunds.value[0]
@@ -89,6 +107,71 @@ const dataModeLabel = computed(() => {
 const dataModeDisclaimer = computed(() => apiConnected.value
   ? '候选来自 AKShare 公开参考数据；未提供的字段会明确显示为“未获取”。'
   : '未连接到数据服务，页面不会以本地模拟基金替代真实数据。')
+
+async function loadConversations() {
+  try {
+    conversations.value = await fetchConversations()
+  } catch {
+    conversations.value = []
+  }
+}
+
+async function openConversation(id: string) {
+  // 再次点击已展开的记录即收起，省得再去点关闭。
+  if (activeConversationId.value === id && conversationMessages.value.length) {
+    activeConversationId.value = ''
+    conversationMessages.value = []
+    return
+  }
+  activeConversationId.value = id
+  conversationLoading.value = true
+  try {
+    conversationMessages.value = (await fetchConversation(id)).messages
+  } catch {
+    conversationMessages.value = []
+    notify('读取研究记录失败')
+  } finally {
+    conversationLoading.value = false
+  }
+}
+
+async function removeConversation(id: string) {
+  try {
+    await deleteConversation(id)
+    conversations.value = conversations.value.filter((item) => item.id !== id)
+    if (activeConversationId.value === id) {
+      activeConversationId.value = ''
+      conversationMessages.value = []
+    }
+    notify('已删除该研究记录')
+  } catch {
+    notify('删除失败，请稍后重试')
+  }
+}
+
+function startNewConversation() {
+  activeConversationId.value = ''
+  conversationMessages.value = []
+  latestRun.value = null
+  activeNav.value = '基金筛选'
+  notify('已开始一轮新的研究')
+}
+
+async function handleAuthenticated(user: AuthUser) {
+  currentUser.value = user
+  await bootstrap()
+}
+
+async function handleLogout() {
+  await logoutSession()
+  currentUser.value = null
+  watchlist.value = []
+  conversations.value = []
+  conversationMessages.value = []
+  activeConversationId.value = ''
+  latestRun.value = null
+  notify('已退出登录')
+}
 
 function notify(message: string) {
   toast.value = message
@@ -147,9 +230,13 @@ async function runResearch() {
       requireOpen: requireOpen.value,
       minimumInceptionYears: checked.value.includes('期限 3 年') ? 3 : 0,
       llm: hasSessionLLM.value ? sessionLLM.value : undefined,
+      // 已有对话即为追问，会接着上一轮存进同一条记录。
+      conversationId: activeConversationId.value,
     })
     latestRun.value = run
+    activeConversationId.value = run.conversationId ?? ''
     availableFunds.value = run.candidates.map((candidate) => candidate.fund)
+    await loadConversations()
     notify(`研究完成：通过硬约束的候选 ${run.candidates.length} 只`)
   } catch (error) {
     notify(error instanceof Error ? error.message : '研究请求失败')
@@ -252,7 +339,7 @@ async function refreshLiveMarket() {
   }
 }
 
-onMounted(async () => {
+async function bootstrap() {
   try {
     const [remoteFunds, remoteWatchlist, remoteAIStatus] = await Promise.all([fetchFunds(), fetchWatchlist(), fetchAIStatus()])
     availableFunds.value = remoteFunds
@@ -261,10 +348,27 @@ onMounted(async () => {
     apiConnected.value = true
     loadError.value = remoteFunds.length ? '' : 'AKShare 当前未返回可展示的基金数据。请检查数据源状态后刷新。'
     await loadMarketQuotes()
+    await loadConversations()
   } catch {
     apiConnected.value = false
     loadError.value = '无法连接基金数据服务。请启动 FastAPI 并确认 AKShare 数据源可用。'
   }
+}
+
+onMounted(async () => {
+  // 令牌一旦失效就把界面切回登录页，而不是让用户对着一堆报错点击。
+  onUnauthorized(() => {
+    currentUser.value = null
+    notify('登录状态已过期，请重新登录')
+  })
+  // 先确认登录态，避免未登录时发出一堆注定 401 的请求。
+  try {
+    currentUser.value = await fetchMe()
+  } catch {
+    currentUser.value = null
+  }
+  authReady.value = true
+  if (currentUser.value) await bootstrap()
   marketTimer = window.setInterval(() => { void loadMarketQuotes() }, 60_000)
 })
 
@@ -274,7 +378,9 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="app-shell">
+  <div v-if="!authReady" class="auth-boot"><RefreshCw :size="18" class="auth-boot-spin" />正在确认登录状态…</div>
+  <LoginView v-else-if="!currentUser" @authenticated="handleAuthenticated" />
+  <main v-else class="app-shell">
     <aside class="sidebar" :class="{ 'is-open': mobileMenuOpen }">
       <div class="brand-row">
         <div class="brand-mark"><Compass :size="23" stroke-width="1.8" /></div>
@@ -302,9 +408,9 @@ onBeforeUnmount(() => {
         <button class="subtle-link" @click="activeNav = '实时行情'">查看行情状态 <ArrowUpRight :size="13" /></button>
       </div>
       <div class="user-card">
-        <div class="avatar">K</div>
-        <div><strong>研究者</strong><span>AKShare 公开参考</span></div>
-        <MoreHorizontal :size="18" />
+        <div class="avatar">{{ userInitial }}</div>
+        <div><strong>{{ currentUser.displayName }}</strong><span>{{ currentUser.email }}</span></div>
+        <button class="icon-button sign-out" title="退出登录" aria-label="退出登录" @click="handleLogout"><LogOut :size="16" /></button>
       </div>
     </aside>
 
@@ -315,7 +421,7 @@ onBeforeUnmount(() => {
         <div class="top-actions">
           <span class="data-chip"><Database :size="14" />{{ dataModeLabel }}</span>
           <button class="icon-button" title="提醒" aria-label="提醒"><BellRing :size="18" /></button>
-          <button class="avatar avatar-small" title="账户">K</button>
+          <button class="avatar avatar-small" :title="currentUser.email" @click="activeNav = '复盘日志'">{{ userInitial }}</button>
         </div>
       </header>
 
@@ -446,9 +552,40 @@ onBeforeUnmount(() => {
           <div class="watchlist-module"><article v-for="fund in watchlist" :key="fund.id" class="watchlist-card"><div class="watchlist-card-head"><div><span class="mini-avatar large">{{ fund.shortName.slice(0, 1) }}</span><div><h2>{{ fund.shortName }}</h2><p>{{ fund.name }} · {{ fund.code }}</p></div></div><button class="icon-button" title="移出观察" @click="toggleWatch(fund)"><X :size="17" /></button></div><div class="watch-metrics"><span>罗盘适配 <b>{{ fund.score }}</b></span><span>净值日期 <b>{{ fund.navDate }}</b></span><span>数据状态 <b>{{ fund.status }}</b></span></div><div class="watch-note"><label>加入原因与下一次复核</label><textarea v-model="noteDraft" placeholder="例如：与新能源主题候选比较后，再决定是否继续关注。"></textarea><button class="small-save" @click="addNote">保存备注</button></div></article><div v-if="!watchlist.length" class="empty-module"><Star :size="30" /><h2>观察列表还是空的</h2><p>先把值得继续研究的基金加入这里，记录当时的理由。</p><button class="run-button" @click="activeNav = '基金筛选'">开始筛选</button></div></div>
         </section>
 
+        <section v-else-if="activeNav === '复盘日志'" class="module-view">
+          <div class="title-row">
+            <div><p class="eyebrow">研究存档 · CONVERSATIONS</p><h1>每一轮研究都留在这里</h1></div>
+            <button class="trace-button" @click="startNewConversation"><Plus :size="16" />开始新一轮研究</button>
+          </div>
+          <div v-if="conversations.length" class="conversation-grid">
+            <article v-for="item in conversations" :key="item.id" class="conversation-card" :class="{ active: activeConversationId === item.id }">
+              <button class="conversation-main" @click="openConversation(item.id)">
+                <h3>{{ item.title }}</h3>
+                <p>{{ item.messageCount }} 条消息 · {{ formatTime(item.updatedAt ?? '') }}</p>
+              </button>
+              <button class="icon-button" title="删除这条记录" aria-label="删除这条记录" @click.stop="removeConversation(item.id)"><X :size="15" /></button>
+            </article>
+          </div>
+          <div v-else class="empty-module">
+            <CalendarClock :size="30" />
+            <h2>还没有研究记录</h2>
+            <p>每次「开始研究」都会在这里留下一条记录，包含当时的研究目标和模型结论，重开服务也不会丢。</p>
+            <button class="run-button" @click="activeNav = '基金筛选'">去研究</button>
+          </div>
+
+          <section v-if="conversationLoading" class="conversation-thread"><p class="thread-loading">正在读取…</p></section>
+          <section v-else-if="conversationMessages.length" class="conversation-thread">
+            <div v-for="message in conversationMessages" :key="message.id" class="thread-message" :class="message.role">
+              <span class="thread-role">{{ message.role === 'user' ? '研究目标' : '模型结论' }}</span>
+              <p>{{ message.content }}</p>
+              <small>{{ formatTime(message.createdAt ?? '') }}</small>
+            </div>
+          </section>
+        </section>
+
         <section v-else class="module-view placeholder-module">
           <div class="title-row"><div><p class="eyebrow">功能规划</p><h1>{{ activeNav }}</h1></div></div>
-          <div class="empty-module"><component :is="activeNav === '目标与风险' ? SlidersHorizontal : CalendarClock" :size="30" /><h2>此模块尚未接入真实数据工作流</h2><p>当前版本只展示由 AKShare 提供的公开参考基金数据；风险画像和复盘记录将在完成持久化后开放。</p><button class="run-button" @click="activeNav = '基金筛选'">回到研究工作台</button></div>
+          <div class="empty-module"><SlidersHorizontal :size="30" /><h2>此模块尚未接入真实数据工作流</h2><p>当前版本只展示由 AKShare 提供的公开参考基金数据；风险画像将在完成持久化后开放。</p><button class="run-button" @click="activeNav = '基金筛选'">回到研究工作台</button></div>
         </section>
       </div>
     </section>

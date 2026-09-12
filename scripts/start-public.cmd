@@ -2,8 +2,9 @@
 REM =============================================================
 REM  Fund Compass - start local backend + public Cloudflare tunnel
 REM
-REM  Invoked by the "FundCompass-Public" scheduled task at boot/logon,
-REM  and usable for a manual restart at any time.
+REM  Double-click to start (or restart) the service. There is no
+REM  boot/logon entry by design, so this is the normal way to bring
+REM  it back up after a reboot.
 REM
 REM  Idempotent: each step is skipped when the thing is already up,
 REM  so running this twice is harmless.

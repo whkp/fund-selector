@@ -3,24 +3,30 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import auth as auth_module
+from . import watchlist as watchlist_module
+from .auth import ConversationNotFound, EmailAlreadyRegistered, current_user
 from .config import config_value
+from .db.base import UserRecord
 from .db.session import database_health
 from .knowledge import build_knowledge_base
 from .llm import LLMConfigurationError, LLMError, LLMNotConfigured, LLMResponseError, LLMService
 from .models import Fund
 from .providers import AKShareProvider, DataRepository
+from .security import EmailFormatError, PasswordPolicyError
 
 
 MODE = str(config_value("app", "mode", "REFERENCE", env_name="FUND_COMPASS_MODE")).upper()
@@ -52,6 +58,11 @@ async def _warm_up() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    try:
+        await auth_module.ensure_auth_schema()
+    except Exception as exc:  # pragma: no cover - 取决于部署环境
+        # 建表失败必须可见，但不能挡住整个服务：基金数据接口仍可读。
+        print(f"[startup] 认证表初始化失败：{exc}", file=sys.stderr)
     warmup = asyncio.create_task(_warm_up())
     try:
         yield
@@ -131,6 +142,8 @@ class ScreenRequest(BaseModel):
     filters: Filters = Field(default_factory=Filters)
     limit: int = Field(default=10, ge=1, le=50)
     llm: LLMRequestConfig | None = None
+    # 留空则自动新建一个对话，供「复盘日志」串起多轮研究。
+    conversationId: str = Field(default="", max_length=64)
 
 
 class WatchRequest(BaseModel):
@@ -211,6 +224,112 @@ async def ready() -> dict[str, Any]:
     if db.get("status") != "ACTIVE":
         raise HTTPException(status_code=503, detail={"code": "DATABASE_UNAVAILABLE", "message": "数据库暂不可用", "retryable": True})
     return {"status": "ready", "mode": MODE.lower(), "dataSource": provider.status.as_dict(), "database": db}
+
+
+# ---------------------------------------------------------------------------
+# 认证与会话
+# ---------------------------------------------------------------------------
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=200)
+    displayName: str = Field(default="", max_length=80)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class ConversationCreateRequest(BaseModel):
+    title: str = Field(default="", max_length=120)
+
+
+def _session_payload(user: UserRecord) -> dict[str, Any]:
+    token, expires_at = auth_module.issue_session_token(user)
+    return {
+        "token": token,
+        "expiresAt": expires_at,
+        "tokenType": "Bearer",
+        "user": auth_module.user_public(user),
+    }
+
+
+@app.post("/api/auth/register", status_code=201)
+async def register(request: RegisterRequest) -> dict[str, Any]:
+    """注册并直接返回登录态。口令强度由 security 层统一校验。"""
+    try:
+        user = await auth_module.create_user(request.email, request.password, request.displayName)
+    except EmailAlreadyRegistered as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "EMAIL_ALREADY_REGISTERED", "message": "该邮箱已注册，请直接登录"}) from exc
+    except PasswordPolicyError as exc:
+        raise HTTPException(status_code=400, detail={
+            "code": "WEAK_PASSWORD", "message": str(exc)}) from exc
+    except EmailFormatError as exc:
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_EMAIL", "message": str(exc)}) from exc
+    return _session_payload(user)
+
+
+@app.post("/api/auth/login")
+async def login(request: LoginRequest) -> dict[str, Any]:
+    user = await auth_module.authenticate(request.email, request.password)
+    if user is None:
+        # 不区分「账号不存在」与「密码错误」，避免账号枚举。
+        raise HTTPException(status_code=401, detail={
+            "code": "INVALID_CREDENTIALS", "message": "邮箱或密码不正确"})
+    return _session_payload(user)
+
+
+@app.get("/api/auth/me")
+async def me(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+    return {"user": auth_module.user_public(user)}
+
+
+@app.post("/api/auth/logout", status_code=204)
+async def logout(user: UserRecord = Depends(current_user)) -> None:
+    """JWT 是无状态的：登出即由客户端丢弃令牌。保留端点便于前端统一调用。"""
+    return None
+
+
+@app.get("/api/conversations")
+async def conversations(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+    return {"items": await auth_module.list_conversations(user.id)}
+
+
+@app.post("/api/conversations", status_code=201)
+async def create_conversation(
+    request: ConversationCreateRequest, user: UserRecord = Depends(current_user)
+) -> dict[str, Any]:
+    return await auth_module.create_conversation(user.id, request.title)
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def conversation_detail(
+    conversation_id: str, user: UserRecord = Depends(current_user)
+) -> dict[str, Any]:
+    try:
+        conversation = await auth_module.get_conversation(user.id, conversation_id)
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail={
+            "code": "CONVERSATION_NOT_FOUND", "message": "对话不存在"}) from exc
+    return {
+        "conversation": conversation,
+        "messages": await auth_module.list_messages(user.id, conversation_id),
+    }
+
+
+@app.delete("/api/conversations/{conversation_id}", status_code=204)
+async def remove_conversation(
+    conversation_id: str, user: UserRecord = Depends(current_user)
+) -> None:
+    try:
+        await auth_module.delete_conversation(user.id, conversation_id)
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail={
+            "code": "CONVERSATION_NOT_FOUND", "message": "对话不存在"}) from exc
 
 
 @app.get("/api/ai/status")
@@ -320,10 +439,26 @@ async def compare(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.post("/api/recommendations/runs")
-async def create_run(request: ScreenRequest) -> dict[str, Any]:
+async def create_run(
+    request: ScreenRequest, user: UserRecord = Depends(current_user)
+) -> dict[str, Any]:
     require_production_data()
     require_public_research()
     await repository.ensure_funds()
+    # 每条研究记录都归属一个对话，让「复盘日志」能串起多轮追问。
+    conversation_id = request.conversationId.strip()
+    if conversation_id:
+        try:
+            await auth_module.get_conversation(user.id, conversation_id)
+        except ConversationNotFound as exc:
+            raise HTTPException(status_code=404, detail={
+                "code": "CONVERSATION_NOT_FOUND", "message": "对话不存在"}) from exc
+    else:
+        conversation_id = (await auth_module.create_conversation(user.id, request.query))["id"]
+    await auth_module.append_message(
+        user.id, conversation_id, "user", request.query,
+        payload={"filters": request.filters.model_dump(), "limit": request.limit},
+    )
     items = research_pool(request)
     knowledge = await knowledge_base.search(request.query, limit=5)
     research_llm = llm_service
@@ -367,27 +502,40 @@ async def create_run(request: ScreenRequest) -> dict[str, Any]:
                      {"event": "tool_completed", "title": "检索真实候选", "detail": f"从 {MODE} AKShare 数据快照取得 {len(items)} 只符合硬约束的候选。", "status": "COMPLETED"},
                      {"event": "llm_completed", "title": "大模型生成研究结论", "detail": "模型输出已按候选代码和结构化 Schema 校验。", "status": "COMPLETED"}],
            "disclaimer": "内容仅供基金研究参考，不构成投资建议。模型不生成交易指令。", "nextQuestions": model_output.followUpQuestions}
+    run["conversationId"] = conversation_id
     repository.runs[run_id] = run
+    await auth_module.append_message(
+        user.id, conversation_id, "assistant", run["summary"], run_id=run_id, payload=run,
+    )
     return run
+
+
+async def _load_run(run_id: str, user: UserRecord) -> dict[str, Any]:
+    """先查内存快路径，再回落到对话记录，进程重启后仍能复盘。"""
+    run = repository.runs.get(run_id)
+    if run is not None:
+        return run
+    message = await auth_module.find_message_by_run(user.id, run_id)
+    payload = (message or {}).get("payload")
+    if isinstance(payload, dict):
+        return payload
+    raise HTTPException(status_code=404, detail={"code": "RUN_NOT_FOUND", "message": "研究记录不存在"})
 
 
 @app.get("/api/recommendations/runs/{run_id}")
-async def get_run(run_id: str) -> dict[str, Any]:
-    run = repository.runs.get(run_id)
-    if not run:
-        raise HTTPException(404, detail={"code": "RUN_NOT_FOUND", "message": "研究记录不存在"})
-    return run
+async def get_run(run_id: str, user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+    return await _load_run(run_id, user)
 
 
 @app.get("/api/recommendations/runs/{run_id}/trace")
-async def get_trace(run_id: str) -> dict[str, Any]:
-    run = await get_run(run_id)
+async def get_trace(run_id: str, user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+    run = await _load_run(run_id, user)
     return {"runId": run_id, "trace": run["trace"], "policyVersion": run["policyVersion"], "modelVersion": run["modelVersion"], "snapshotId": run["snapshotId"]}
 
 
 @app.get("/api/recommendations/runs/{run_id}/events")
-async def get_events(run_id: str) -> dict[str, Any]:
-    run = await get_run(run_id)
+async def get_events(run_id: str, user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+    run = await _load_run(run_id, user)
     return {"runId": run_id, "events": run["trace"]}
 
 
@@ -419,27 +567,26 @@ async def refresh_funds() -> dict[str, Any]:
 
 
 @app.get("/api/watchlist/items")
-async def list_watchlist() -> dict[str, Any]:
-    if MODE != "LOCAL" and not PUBLIC_WRITE_ENABLED:
-        return {"items": []}
-    return {"items": list(repository.watchlist.values())}
+async def list_watchlist(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+    await repository.ensure_funds()
+    return {"items": await watchlist_module.list_items(user.id, repository.get_fund)}
 
 
 @app.post("/api/watchlist/items", status_code=201)
-async def add_watch(request: WatchRequest) -> dict[str, Any]:
-    require_public_write()
+async def add_watch(
+    request: WatchRequest, user: UserRecord = Depends(current_user)
+) -> dict[str, Any]:
+    await repository.ensure_funds()
     fund = repository.get_fund(request.fundCode)
     if not fund:
         raise HTTPException(404, detail={"code": "FUND_NOT_FOUND", "message": "基金不存在"})
-    return repository.add_watch(fund, request.note, request.reasonTags)
+    return await watchlist_module.add_item(user.id, fund, request.note, request.reasonTags)
 
 
 @app.delete("/api/watchlist/items/{code}", status_code=204)
-async def remove_watch(code: str) -> None:
-    require_public_write()
-    if code not in repository.watchlist:
+async def remove_watch(code: str, user: UserRecord = Depends(current_user)) -> None:
+    if not await watchlist_module.remove_item(user.id, code):
         raise HTTPException(404, detail={"code": "WATCHLIST_ITEM_NOT_FOUND", "message": "观察列表中没有该基金"})
-    del repository.watchlist[code]
 
 
 @app.get("/api/profile/risk")

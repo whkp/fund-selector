@@ -1,4 +1,5 @@
 import os
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -56,6 +57,17 @@ def reset_repository(monkeypatch: pytest.MonkeyPatch) -> None:
 client = TestClient(app)
 
 
+def register_user(prefix: str = "tester") -> dict[str, str]:
+    """注册一个随机邮箱的用户，返回可直接用于请求的 Authorization 头。"""
+    response = client.post("/api/auth/register", json={
+        "email": f"{prefix}_{uuid.uuid4().hex[:10]}@example.com",
+        "password": "test-password-123",
+        "displayName": "测试用户",
+    })
+    assert response.status_code == 201, response.text
+    return {"Authorization": f"Bearer {response.json()['token']}"}
+
+
 def test_health_exposes_python_api_and_reference_mode():
     response = client.get("/health")
     assert response.status_code == 200
@@ -86,13 +98,14 @@ def test_screen_preserves_unknown_fields_for_reference_research():
 
 
 def test_recommendation_run_can_be_replayed():
+    headers = register_user()
     response = client.post("/api/recommendations/runs", json={
         "query": "长期定投新能源", "limit": 3,
         "filters": {"riskLevelMax": "中高风险", "maxFee": 1.2, "requireOpen": True},
-    })
+    }, headers=headers)
     assert response.status_code == 200
     run = response.json()
-    trace = client.get(f"/api/recommendations/runs/{run['runId']}/trace")
+    trace = client.get(f"/api/recommendations/runs/{run['runId']}/trace", headers=headers)
     assert trace.status_code == 200
     assert trace.json()["snapshotId"] == run["snapshotId"]
     assert run["interpretation"]["provider"] == llm_service.provider
@@ -101,12 +114,35 @@ def test_recommendation_run_can_be_replayed():
     assert run["candidates"][0]["sourceSummary"]["officialDisclosureChecked"] is False
 
 
+def test_research_run_is_persisted_into_a_conversation():
+    headers = register_user()
+    response = client.post("/api/recommendations/runs", json={
+        "query": "长期定投新能源", "limit": 3, "filters": {"maxFee": 1.2},
+    }, headers=headers)
+    assert response.status_code == 200
+    conversation_id = response.json()["conversationId"]
+    assert conversation_id
+
+    detail = client.get(f"/api/conversations/{conversation_id}", headers=headers)
+    assert detail.status_code == 200
+    roles = [message["role"] for message in detail.json()["messages"]]
+    assert roles == ["user", "assistant"]
+    assert detail.json()["messages"][0]["content"] == "长期定投新能源"
+    assert detail.json()["conversation"]["messageCount"] == 2
+
+
+def test_research_run_requires_login():
+    response = client.post("/api/recommendations/runs", json={"query": "匿名", "limit": 1})
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "UNAUTHENTICATED"
+
+
 def test_session_llm_requires_a_key_and_does_not_fallback_to_global_rules():
     response = client.post("/api/recommendations/runs", json={
         "query": "短期测试", "limit": 1,
         "filters": {"maxFee": 1.2},
         "llm": {"provider": "openai-compatible", "baseUrl": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
-    })
+    }, headers=register_user())
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "INVALID_LLM_CONFIGURATION"
 
@@ -130,20 +166,34 @@ def test_session_llm_key_is_not_written_to_research_run(monkeypatch: pytest.Monk
     response = client.post("/api/recommendations/runs", json={
         "query": "会话测试", "limit": 1, "filters": {},
         "llm": {"provider": "openai-compatible", "baseUrl": "https://api.deepseek.com/v1", "apiKey": "session-secret", "model": "deepseek-chat"},
-    })
+    }, headers=register_user())
     assert response.status_code == 200
     assert "session-secret" not in response.text
     assert response.json()["interpretation"]["provider"] == "openai-compatible"
 
 
-def test_watchlist_lifecycle(monkeypatch: pytest.MonkeyPatch):
-    # Local integration behavior is exercised explicitly; public Reference mode
-    # is otherwise read-only by default.
-    monkeypatch.setattr("app.main.PUBLIC_WRITE_ENABLED", True)
-    created = client.post("/api/watchlist/items", json={"fundCode": "008286", "reasonTags": ["新能源"]})
+def test_watchlist_lifecycle():
+    headers = register_user()
+    created = client.post("/api/watchlist/items", json={"fundCode": "008286", "reasonTags": ["新能源"]}, headers=headers)
     assert created.status_code == 201
-    assert client.get("/api/watchlist/items").json()["items"]
-    assert client.delete("/api/watchlist/items/008286").status_code == 204
+    assert created.json()["fund"]["code"] == "008286"
+    assert client.get("/api/watchlist/items", headers=headers).json()["items"]
+    assert client.delete("/api/watchlist/items/008286", headers=headers).status_code == 204
+    assert client.get("/api/watchlist/items", headers=headers).json()["items"] == []
+
+
+def test_watchlist_is_isolated_between_users():
+    owner = register_user("owner")
+    stranger = register_user("stranger")
+    assert client.post(
+        "/api/watchlist/items", json={"fundCode": "012349"}, headers=owner
+    ).status_code == 201
+
+    assert [item["fund"]["code"] for item in client.get("/api/watchlist/items", headers=owner).json()["items"]] == ["012349"]
+    # 另一个用户看不到，也不能替别人删掉。
+    assert client.get("/api/watchlist/items", headers=stranger).json()["items"] == []
+    assert client.delete("/api/watchlist/items/012349", headers=stranger).status_code == 404
+    assert client.get("/api/watchlist/items", headers=owner).json()["items"]
 
 
 def test_compare_rejects_more_than_four_funds():
@@ -151,10 +201,12 @@ def test_compare_rejects_more_than_four_funds():
     assert response.status_code == 400
 
 
-def test_reference_mode_is_read_only_by_default():
+def test_anonymous_write_requires_login():
+    """多用户之后，写操作的门槛从「总开关」变成了「有没有登录」。"""
     response = client.post("/api/watchlist/items", json={"fundCode": "008286"})
-    assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "PUBLIC_WRITE_DISABLED"
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "UNAUTHENTICATED"
+    assert client.get("/api/watchlist/items").status_code == 401
 
 
 def test_production_mode_requires_a_production_data_source(monkeypatch: pytest.MonkeyPatch):
