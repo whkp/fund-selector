@@ -1,3 +1,7 @@
+# 默认交给 git 自动判定行尾。这条必须放在最前面：后面的规则要能覆盖它，
+# 否则通用规则会把下面按扩展名的 eol 设置盖掉。
+* text=auto
+
 # Shell 脚本与容器构建文件在 Linux 环境执行，必须保持 LF 行尾：
 # CRLF 会让 shebang 变成 `#!/usr/bin/env bash\r` 而无法执行，也可能导致
 # Docker 构建在解析指令时出错。
@@ -5,9 +9,6 @@
 Dockerfile text eol=lf
 .dockerignore text eol=lf
 
-# Windows 批处理必须在 Windows 上以 CRLF 检出，否则 goto/label 解析会出问题。
+# Windows 批处理必须以 CRLF 检出，否则 goto/label 解析会出问题。
 *.cmd text eol=crlf
 *.bat text eol=crlf
-
-# 其余文本文件交给 git 自动判定行尾，Windows 检出为 CRLF 不影响使用。
-* text=auto
