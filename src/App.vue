@@ -28,6 +28,9 @@ const maxFee = ref(1.2)
 const requireOpen = ref(true)
 const checked = ref(['期限 3 年', '中等风险', '定投方式', '开放申购'])
 const availableFunds = ref<Fund[]>([])
+// 完整基金全集，只在初始加载/手动刷新时更新。研究结果会覆盖 availableFunds，
+// 但类型选项必须始终基于全集，否则跑完一次研究筛选条就塌了。
+const fundUniverse = ref<Fund[]>([])
 const watchlist = ref<Fund[]>([])
 const compareList = ref<Fund[]>([])
 const selectedFund = ref<Fund | null>(null)
@@ -68,11 +71,58 @@ const navigation = [
   { label: '复盘日志', icon: CalendarClock }
 ]
 
+// AKShare 公开排行不返回风险等级、申购状态与成立年限，这些字段会落成"未获取"。
+// 与后端 eligibility() 保持同一套规则：缺失不排除，只如实标注未核验。
+const UNKNOWN_VALUES = new Set(['', '未获取', '未知', '未标注', '待核', 'none', 'null', 'n/a', '-'])
+const TYPE_SEPARATORS = /[-—－–/／·|]/
+
+function isKnown(value: unknown): boolean {
+  if (value === null || value === undefined) return false
+  return !UNKNOWN_VALUES.has(String(value).trim().toLowerCase())
+}
+
+/** 数据侧是 "混合型-偏股"，界面给的是 "混合型"，所以按切分后的根段比较。 */
+function matchesFundType(fundTypeValue: unknown, wanted: string): boolean {
+  if (!wanted || wanted === '不限') return true
+  const source = String(fundTypeValue ?? '').trim()
+  if (!source) return false
+  const segments = source.split(TYPE_SEPARATORS).map((segment) => segment.trim()).filter(Boolean)
+  return source === wanted || source.startsWith(wanted) || segments.includes(wanted)
+}
+
+function fundTypeRoot(fundTypeValue: unknown): string {
+  return String(fundTypeValue ?? '').split(TYPE_SEPARATORS)[0]?.trim() ?? ''
+}
+
+/** 类型选项由真实数据生成：数据源里没有的类型不再画成死按钮。 */
+const fundTypeOptions = computed(() => {
+  const tally = new Map<string, number>()
+  for (const fund of availableFunds.value) {
+    const root = fundTypeRoot(fund.type)
+    if (!root) continue
+    tally.set(root, (tally.get(root) ?? 0) + 1)
+  }
+  const options = [...tally.entries()].sort((a, b) => b[1] - a[1]).map(([label, count]) => ({ label, count }))
+  return [{ label: '不限', count: availableFunds.value.length }, ...options]
+})
+
+const emptyHint = computed(() => {
+  if (latestRun.value) return '模型未从当前真实候选范围中返回结果，请调整目标或补充条件。'
+  if (loadError.value) return loadError.value
+  if (fundType.value !== '不限' && fundUniverse.value.length) {
+    const inUniverse = fundUniverse.value.some((fund) => matchesFundType(fund.type, fundType.value))
+    return inUniverse
+      ? `本次研究候选里没有「${fundType.value}」类型的基金，可在左侧切回不限。`
+      : `当前数据源没有「${fundType.value}」类型的基金。AKShare 公开排行只提供收益前 500 名，类型分布见左侧筛选条。`
+  }
+  return '正在从 AKShare 同步公开参考数据。'
+})
+
 const displayedFunds = computed(() => {
   const riskRank: Record<string, number> = { '低风险': 1, '中低风险': 2, '中风险': 3, '中高风险': 4, '高风险': 5 }
   return availableFunds.value
-    .filter((fund) => fundType.value === '不限' || fund.type === fundType.value)
-    .filter((fund) => !(fund.risk in riskRank) || riskRank[fund.risk] <= riskRank[riskLimit.value])
+    .filter((fund) => matchesFundType(fund.type, fundType.value))
+    .filter((fund) => !isKnown(fund.risk) || riskRank[fund.risk] <= riskRank[riskLimit.value])
     .filter((fund) => fund.fee === null || fund.fee <= maxFee.value)
     .slice(0, 30)
 })
@@ -343,6 +393,7 @@ async function bootstrap() {
   try {
     const [remoteFunds, remoteWatchlist, remoteAIStatus] = await Promise.all([fetchFunds(), fetchWatchlist(), fetchAIStatus()])
     availableFunds.value = remoteFunds
+    fundUniverse.value = remoteFunds
     watchlist.value = remoteWatchlist
     aiStatus.value = remoteAIStatus
     apiConnected.value = true
@@ -460,7 +511,7 @@ onBeforeUnmount(() => {
               <div class="section-caption"><ListFilter :size="16" /><span>筛选条件</span><button @click="resetResearch">重置</button></div>
               <label class="filter-label">基金类型</label>
               <div class="filter-options">
-                <button v-for="option in ['不限', '混合型', '指数型', '债券型']" :key="option" :class="{ selected: fundType === option }" @click="fundType = option">{{ option }}</button>
+                <button v-for="option in fundTypeOptions" :key="option.label" :class="{ selected: fundType === option.label }" @click="fundType = option.label">{{ option.label }}<em>{{ option.count }}</em></button>
               </div>
               <label class="filter-label">最高风险等级</label>
               <div class="select-wrap"><select v-model="riskLimit"><option>中风险</option><option>中高风险</option><option>高风险</option></select><ChevronDown :size="16" /></div>
@@ -471,6 +522,7 @@ onBeforeUnmount(() => {
               <div class="scale-row"><span>0.40%</span><span>1.50%</span></div>
               <label class="toggle-row"><span><b>仅看开放申购</b><small>排除暂停与限额状态</small></span><input v-model="requireOpen" type="checkbox" /><i></i></label>
               <div class="filter-foot"><ShieldCheck :size="17" /><p>硬约束由服务端校验，研究结论由已配置的大模型生成。</p></div>
+              <p class="filter-caveat">AKShare 公开排行未提供风险等级、申购状态与成立年限，这些条件在数据缺失时不会排除候选，只标注为未核验。</p>
             </aside>
 
             <section class="results-panel">
@@ -490,7 +542,7 @@ onBeforeUnmount(() => {
                 <div class="fund-score"><span>参考排序</span><strong>{{ fund.score }}</strong><i>/100</i></div>
                 <div class="card-actions"><button class="icon-button" :class="{ active: isWatching(fund) }" :title="isWatching(fund) ? '移出观察' : '加入观察'" @click="toggleWatch(fund)"><Star :size="17" :fill="isWatching(fund) ? 'currentColor' : 'none'" /></button><button class="icon-button" :class="{ active: isComparing(fund) }" :title="isComparing(fund) ? '移出对比' : '加入对比'" @click="toggleCompare(fund)"><ArrowDownUp :size="17" /></button><button class="detail-button" @click="openFund(fund)">查看详情 <ChevronRight :size="15" /></button></div>
               </article>
-              <div v-if="!displayedFunds.length" class="empty-module"><Database :size="30" /><h2>暂未得到研究候选</h2><p>{{ latestRun ? '模型未从当前真实候选范围中返回结果，请调整目标或补充条件。' : (loadError || '正在从 AKShare 同步公开参考数据。') }}</p></div>
+              <div v-if="!displayedFunds.length" class="empty-module"><Database :size="30" /><h2>暂未得到研究候选</h2><p>{{ emptyHint }}</p></div>
               <p class="results-note"><Info :size="14" />候选不代表买入建议。{{ dataModeDisclaimer }}</p>
             </section>
 

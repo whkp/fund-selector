@@ -160,6 +160,102 @@ class WatchRequest(BaseModel):
 
 RISK_RANK = {"低风险": 1, "中低风险": 2, "中风险": 3, "中高风险": 4, "高风险": 5}
 
+# AKShare 的公开排行接口不返回风险等级、申购状态和成立年限，这些字段会落成"未获取"。
+# 缺失不等于不合格：字段未知时放行，并记录到 unverified 里如实告知用户，
+# 而不是静默地把全部候选清空 —— 那会让「暂未得到研究候选」变成必然结果。
+UNKNOWN_VALUES = {"", "未获取", "未知", "未标注", "待核", "none", "null", "n/a", "-"}
+
+TYPE_SEPARATORS = r"[-—－–/／·|]"
+
+
+def is_known(value: Any) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() not in UNKNOWN_VALUES
+
+
+def type_matches(fund_type: Any, wanted: list[str]) -> bool:
+    """按类型根段匹配，兼容 AKShare 的复合类型名。
+
+    数据侧给的是 "混合型-偏股" / "指数型-海外股票" / "QDII-混合偏股"，
+    界面给用户选的是 "混合型" / "指数型" 这类大类。精确相等会让每一次
+    类型筛选都返回空集，所以这里比较切分后的根段。
+    """
+    targets = [item.strip() for item in wanted if item and item.strip()]
+    if not targets:
+        return True
+    source = str(fund_type or "").strip()
+    if not source:
+        return False
+    segments = [segment.strip() for segment in re.split(TYPE_SEPARATORS, source) if segment.strip()]
+    for target in targets:
+        if source == target or source.startswith(target) or target in segments:
+            return True
+    return False
+
+
+def eligibility(fund: Fund, filters: Filters) -> tuple[bool, list[str]]:
+    """硬约束判定。返回 (是否通过, 因数据缺失而未能真正参与判定的字段)。"""
+    unverified: list[str] = []
+    if not type_matches(fund.type, filters.fundTypes):
+        return False, unverified
+    if filters.riskLevelMax:
+        if not is_known(fund.risk):
+            unverified.append("风险等级")
+        elif RISK_RANK.get(fund.risk, 99) > RISK_RANK.get(filters.riskLevelMax, 99):
+            return False, unverified
+    if filters.maxFee:
+        if fund.fee is None:
+            unverified.append("管理费")
+        elif fund.fee > filters.maxFee:
+            return False, unverified
+    if filters.requireOpen:
+        if not is_known(fund.intake):
+            unverified.append("申购状态")
+        elif fund.intake != "开放申购":
+            return False, unverified
+    if filters.minimumInceptionYears:
+        if fund.inception is None:
+            unverified.append("成立年限")
+        elif fund.inception < filters.minimumInceptionYears:
+            return False, unverified
+    return True, unverified
+
+
+def unverified_note(funds: list[Fund], filters: Filters) -> str:
+    """哪些硬约束因数据缺失而没能生效 —— 写进研究 trace，避免用户误判筛选已生效。"""
+    if not funds:
+        return ""
+    tally: dict[str, int] = {}
+    for fund in funds:
+        _, missing = eligibility(fund, filters)
+        for field in missing:
+            tally[field] = tally.get(field, 0) + 1
+    if not tally:
+        return ""
+    ordered = sorted(tally.items(), key=lambda pair: (-pair[1], pair[0]))
+    detail = "、".join(f"{field} {count}/{len(funds)} 只未获取" for field, count in ordered)
+    return f"AKShare 公开排行未提供 {detail}，这些字段未参与筛除。"
+
+
+def empty_pool_reason(filters: Filters, universe: list[Fund]) -> str:
+    """候选为空时，指出是哪一条约束把集合清空了，而不是只说一句"没有候选"。"""
+    reasons: list[str] = []
+    if filters.fundTypes:
+        if not any(type_matches(fund.type, filters.fundTypes) for fund in universe):
+            available = sorted({re.split(TYPE_SEPARATORS, str(fund.type or ""))[0].strip() for fund in universe if fund.type})
+            reasons.append(
+                f"类型「{'、'.join(filters.fundTypes)}」在当前数据源中没有匹配项（现有类型：{'、'.join(available) or '无'}）"
+            )
+    if filters.maxFee:
+        if not any(fund.fee is None or fund.fee <= filters.maxFee for fund in universe):
+            reasons.append(f"管理费上限 {filters.maxFee}% 没有基金满足")
+    if filters.riskLevelMax:
+        cap = RISK_RANK.get(filters.riskLevelMax, 99)
+        if not any((not is_known(fund.risk)) or RISK_RANK.get(fund.risk, 99) <= cap for fund in universe):
+            reasons.append(f"最高风险等级「{filters.riskLevelMax}」下没有基金")
+    return ("；".join(reasons) + "。") if reasons else ""
+
 
 def envelope(items: Any) -> dict[str, Any]:
     source = provider.status.as_dict()
@@ -180,16 +276,8 @@ def query_score(fund: Fund, query: str) -> int:
 def filtered(request: ScreenRequest) -> list[Fund]:
     result = []
     for fund in repository.list_funds():
-        filters = request.filters
-        if filters.fundTypes and fund.type not in filters.fundTypes:
-            continue
-        if filters.riskLevelMax and (fund.risk not in RISK_RANK or RISK_RANK[fund.risk] > RISK_RANK.get(filters.riskLevelMax, 99)):
-            continue
-        if filters.maxFee and (fund.fee is None or fund.fee > filters.maxFee):
-            continue
-        if filters.requireOpen and fund.intake != "开放申购":
-            continue
-        if filters.minimumInceptionYears and (fund.inception is None or fund.inception < filters.minimumInceptionYears):
+        passed, _ = eligibility(fund, request.filters)
+        if not passed:
             continue
         clone = Fund(**{**fund.__dict__, "score": query_score(fund, request.query)})
         result.append(clone)
@@ -200,16 +288,8 @@ def research_pool(request: ScreenRequest) -> list[Fund]:
     """Apply only explicit eligibility constraints; ranking belongs to the model."""
     result = []
     for fund in repository.list_funds():
-        filters = request.filters
-        if filters.fundTypes and fund.type not in filters.fundTypes:
-            continue
-        if filters.riskLevelMax and (fund.risk not in RISK_RANK or RISK_RANK[fund.risk] > RISK_RANK.get(filters.riskLevelMax, 99)):
-            continue
-        if filters.maxFee and (fund.fee is None or fund.fee > filters.maxFee):
-            continue
-        if filters.requireOpen and fund.intake != "开放申购":
-            continue
-        if filters.minimumInceptionYears and (fund.inception is None or fund.inception < filters.minimumInceptionYears):
+        passed, _ = eligibility(fund, request.filters)
+        if not passed:
             continue
         result.append(fund)
     # Keep the prompt bounded while preserving the provider's current reference order.
@@ -477,20 +557,21 @@ async def create_run(
     require_public_research()
     await repository.ensure_funds()
     # 每条研究记录都归属一个对话，让「复盘日志」能串起多轮追问。
-    conversation_id = request.conversationId.strip()
-    if conversation_id:
+    # 先判定候选池再落库：条件不成立时不该在「复盘日志」里留下一问无答的空对话。
+    items = research_pool(request)
+    if not items:
+        raise HTTPException(status_code=400, detail={
+            "code": "NO_ELIGIBLE_CANDIDATES",
+            "message": "当前条件下没有符合条件的基金候选。" + empty_pool_reason(request.filters, repository.list_funds()),
+        })
+    # 追问时先确认对话归属，避免为一个不存在的对话白跑一次模型。
+    requested_conversation = request.conversationId.strip()
+    if requested_conversation:
         try:
-            await auth_module.get_conversation(user.id, conversation_id)
+            await auth_module.get_conversation(user.id, requested_conversation)
         except ConversationNotFound as exc:
             raise HTTPException(status_code=404, detail={
                 "code": "CONVERSATION_NOT_FOUND", "message": "对话不存在"}) from exc
-    else:
-        conversation_id = (await auth_module.create_conversation(user.id, request.query))["id"]
-    await auth_module.append_message(
-        user.id, conversation_id, "user", request.query,
-        payload={"filters": request.filters.model_dump(), "limit": request.limit},
-    )
-    items = research_pool(request)
     knowledge = await knowledge_base.search(request.query, limit=5)
     research_llm = llm_service
     try:
@@ -505,6 +586,12 @@ async def create_run(
         raise HTTPException(status_code=502, detail={"code": "LLM_RESPONSE_INVALID", "message": str(exc)}) from exc
     except LLMError as exc:
         raise HTTPException(status_code=502, detail={"code": "LLM_UNAVAILABLE", "message": str(exc)}) from exc
+    # 模型确实产出了结论，此时才建对话并写入这一轮问答。
+    conversation_id = requested_conversation or (await auth_module.create_conversation(user.id, request.query))["id"]
+    await auth_module.append_message(
+        user.id, conversation_id, "user", request.query,
+        payload={"filters": request.filters.model_dump(), "limit": request.limit},
+    )
     by_code = {item.code: item for item in items}
     ranked_funds: list[tuple[Fund, Any]] = []
     for assessment in model_output.ranking:
@@ -530,7 +617,7 @@ async def create_run(
                            "recommendationScore": assessment.score} for index, (fund, assessment) in enumerate(ranked_funds)],
            "trace": [{"event": "plan_created", "title": "理解研究目标", "detail": model_output.intent, "status": "COMPLETED"},
                      {"event": "knowledge_retrieved", "title": "检索研究知识库", "detail": f"检索到 {len(knowledge)} 个可引用片段。", "status": "COMPLETED"},
-                     {"event": "tool_completed", "title": "检索真实候选", "detail": f"从 {MODE} AKShare 数据快照取得 {len(items)} 只符合硬约束的候选。", "status": "COMPLETED"},
+                     {"event": "tool_completed", "title": "检索真实候选", "detail": f"从 {MODE} AKShare 数据快照取得 {len(items)} 只符合硬约束的候选。{unverified_note(items, request.filters)}", "status": "COMPLETED"},
                      {"event": "llm_completed", "title": "大模型生成研究结论", "detail": "模型输出已按候选代码和结构化 Schema 校验。", "status": "COMPLETED"}],
            "disclaimer": "内容仅供基金研究参考，不构成投资建议。模型不生成交易指令。", "nextQuestions": model_output.followUpQuestions}
     run["conversationId"] = conversation_id
