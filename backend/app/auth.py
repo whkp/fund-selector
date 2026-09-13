@@ -166,12 +166,32 @@ def verify_invite_code(provided: str) -> bool:
     return match_invite_code(provided, codes)
 
 
+def mask_invite_code(code: str) -> str:
+    """把邀请码压成 `ab12****` 这种只留前缀的形式。
+
+    目的是让日志仍能帮运维确认「当前生效的是哪一张码」（分批发码时有用），
+    又不足以被直接拿去注册 —— 邀请码是唯一的准入凭证，完整值不该出现在
+    任何可能被第三方看到的输出里。
+    """
+    text = (code or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 4:
+        return "*" * len(text)
+    return text[:4] + "*" * (len(text) - 4)
+
+
 def describe_invite_policy() -> str:
-    """启动日志用的一行摘要，方便随时把码抄给要邀请的人。"""
+    """启动日志用的一行摘要。
+
+    刻意只打印掩码：`logs/` 在本地有 .gitignore 兜着，但部署到云平台后运行日志
+    对项目成员可见，打印明文等于把邀请制挂在墙上。要看完整码请用
+    `scripts/show-invite-code.cmd`，读的是同一个落盘文件。
+    """
     codes = _active_invite_codes()
     if not codes:
         return "registration is OPEN - no invite code required"
-    return "registration requires invite code: " + ", ".join(codes)
+    return "registration requires invite code: " + ", ".join(mask_invite_code(code) for code in codes)
 
 
 def active_invite_codes() -> list[str]:

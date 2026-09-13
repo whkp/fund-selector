@@ -8,10 +8,15 @@ services:
     envVars:
       - key: FUND_COMPASS_MODE
         value: REFERENCE
+      # 只挡匿名写操作（数据全量刷新），不影响登录用户维护自己的观察列表。
       - key: FUND_COMPASS_PUBLIC_WRITE_ENABLED
         value: "false"
+      # 必须为 true。这个开关由 create_run 里的 require_public_research() 检查，
+      # 而该端点在认证之后才执行到这里 —— 配成 false 的话，即便是登录用户
+      # 也会被 403，云端会表现为「模型配好了却永远出不了研究结果」。
+      # 匿名刷模型的风险已经由强制登录 + 按用户配额挡住，不需要靠这个开关兜。
       - key: FUND_COMPASS_PUBLIC_RESEARCH_ENABLED
-        value: "false"
+        value: "true"
       - key: FUND_COMPASS_CORS_ORIGINS
         sync: false
       - key: FUND_COMPASS_AKSHARE_ENABLED

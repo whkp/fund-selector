@@ -24,6 +24,16 @@ os.environ["FUND_COMPASS_JWT_SECRET"] = "test-secret-not-for-production"
 # 期望值。不设的话会走「自动生成并落盘」分支，测试结果就依赖磁盘上残留的文件。
 os.environ["FUND_COMPASS_INVITE_CODE"] = "test-invite-code"
 
+# 限流默认值是按「真人手工点几下」定的，但测试会在同一个进程里连着注册几十个
+# 账号、反复登录，而且全部来自同一个回环 IP —— 不放宽的话既有用例会先撞上 429，
+# 失败原因看起来还和被测逻辑无关。限流本身的行为由 tests/test_rate_limit.py
+# 用显式的小上限单独验证，那边每个用例都会重置计数器。
+for _rate_limit_name in (
+    "LOGIN_IP", "LOGIN_ACCOUNT", "REGISTER_IP", "REGISTER_GLOBAL",
+    "RESEARCH_USER_HOURLY", "RESEARCH_USER_DAILY", "RESEARCH_GLOBAL_DAILY",
+):
+    os.environ[f"FUND_COMPASS_RATE_LIMIT_{_rate_limit_name}_MAX"] = "100000"
+
 import pytest  # noqa: E402
 
 

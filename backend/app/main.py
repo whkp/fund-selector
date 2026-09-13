@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import auth as auth_module
+from . import ratelimit as ratelimit_module
 from . import watchlist as watchlist_module
 from .auth import ConversationNotFound, EmailAlreadyRegistered, current_user
 from .config import config_value
@@ -63,10 +64,15 @@ async def lifespan(_: FastAPI):
     except Exception as exc:  # pragma: no cover - 取决于部署环境
         # 建表失败必须可见，但不能挡住整个服务：基金数据接口仍可读。
         print(f"[startup] 认证表初始化失败：{exc}", file=sys.stderr)
-    # 邀请码只在这里出现一次，方便把码抄给被邀请的人；
-    # `/api/auth/policy` 永远不回显它，否则等于公开挂在墙上。
+    # 这里只打印掩码：完整邀请码一旦进了日志，就会流向任何能看到运行日志的人，
+    # 在云平台上那就是全部项目成员 —— 邀请制当场失效。要抄码请用
+    # `scripts/show-invite-code.cmd`，它读的是同一个落盘文件。
+    # `/api/auth/policy` 同样永远不回显它，否则等于公开挂在墙上。
     try:
         print(f"[startup] {auth_module.describe_invite_policy()}", file=sys.stderr)
+        if auth_module.invite_policy().get("inviteRequired"):
+            print("[startup] 完整邀请码请运行 scripts\\show-invite-code.cmd 查看（日志只打掩码）",
+                  file=sys.stderr)
     except Exception as exc:  # pragma: no cover - 取决于部署环境
         print(f"[startup] 邀请码策略读取失败：{exc}", file=sys.stderr)
     warmup = asyncio.create_task(_warm_up())
@@ -125,6 +131,72 @@ def require_production_data() -> None:
         raise HTTPException(status_code=503, detail={
             "code": "PRODUCTION_DATA_NOT_READY", "message": "生产数据源尚未完成配置", "retryable": False
         })
+
+
+# ---------------------------------------------------------------------------
+# 限流
+# ---------------------------------------------------------------------------
+# 认证回答的是「谁能用」，限流回答的是「用多少」。缺了后者有两个真实缺口：
+# 服务端 LLM Key 会被任一注册用户无限刷（费用记在部署者账上），
+# 登录接口的 24 万次 PBKDF2 迭代可被并发请求打满 CPU。
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}
+
+
+def client_ip(request: Request) -> str:
+    """取访客真实 IP，用于按来源限流。
+
+    部署形态是 Cloudflare 隧道：源站只接受 cloudflared 发起的回环连接，真实访客
+    IP 在 `CF-Connecting-IP` 里。所以**只有对端是回环地址时才采信转发头** ——
+    否则任何人都能伪造 `CF-Connecting-IP: 随便填`，让每个请求落进不同的桶，
+    等于把限流整个关掉。
+    """
+    peer = request.client.host if request.client else ""
+    if peer in _LOOPBACK_HOSTS:
+        forwarded = (request.headers.get("CF-Connecting-IP") or "").strip()
+        if not forwarded:
+            forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    return peer or "unknown"
+
+
+def describe_window(seconds: int) -> str:
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400} 天"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} 小时"
+    if seconds % 60 == 0:
+        return f"{seconds // 60} 分钟"
+    return f"{seconds} 秒"
+
+
+def _rate_limited(decision: ratelimit_module.RateLimitDecision, rule: ratelimit_module.RateLimitRule,
+                  code: str, action: str) -> HTTPException:
+    return HTTPException(
+        status_code=429,
+        detail={
+            "code": code,
+            "message": f"{action}过于频繁：{describe_window(rule.window_seconds)}内最多 {rule.limit} 次，"
+                       f"请 {decision.retry_after} 秒后再试。",
+            "retryAfterSeconds": decision.retry_after,
+        },
+        headers={"Retry-After": str(decision.retry_after)},
+    )
+
+
+def enforce_rate_limit(key: str, rule: ratelimit_module.RateLimitRule, *, code: str, action: str) -> None:
+    """消费一次配额，超限即 429。"""
+    decision = ratelimit_module.limiter.hit(key, rule)
+    if not decision.allowed:
+        raise _rate_limited(decision, rule, code, action)
+
+
+def check_rate_limit(decision: ratelimit_module.RateLimitDecision, rule: ratelimit_module.RateLimitRule,
+                     *, code: str, action: str) -> None:
+    """只判定不消费。用于「已经超限就别再往下算了」的前置短路。"""
+    if not decision.allowed:
+        raise _rate_limited(decision, rule, code, action)
 
 
 class Filters(BaseModel):
@@ -345,15 +417,21 @@ def _session_payload(user: UserRecord) -> dict[str, Any]:
 
 
 @app.post("/api/auth/register", status_code=201)
-async def register(request: RegisterRequest) -> dict[str, Any]:
+async def register(payload: RegisterRequest, request: Request) -> dict[str, Any]:
     """注册并直接返回登录态。口令强度由 security 层统一校验。"""
-    # 邀请码放在最前面。没通过准入的请求不会进建号逻辑：既省下 PBKDF2 的
+    # 限流排在最前面：拿脚本批量试邀请码这件事，本就该拦在 PBKDF2 之前。
+    enforce_rate_limit(f"rl:register:ip:{client_ip(request)}", ratelimit_module.register_ip_rule(),
+                       code="REGISTER_RATE_LIMITED", action="注册")
+    # 再按全站兜一道，挡的是换 IP 的分布式尝试。
+    enforce_rate_limit("rl:register:global", ratelimit_module.register_global_rule(),
+                       code="REGISTER_RATE_LIMITED", action="注册")
+    # 邀请码排在建号之前。没通过准入的请求不会进建号逻辑：既省下 PBKDF2 的
     # 24 万次迭代，也避免用 409 告诉对方「这个邮箱已经注册过」。
-    if not auth_module.verify_invite_code(request.inviteCode):
+    if not auth_module.verify_invite_code(payload.inviteCode):
         raise HTTPException(status_code=400, detail={
             "code": "INVALID_INVITE_CODE", "message": "邀请码不正确"})
     try:
-        user = await auth_module.create_user(request.email, request.password, request.displayName)
+        user = await auth_module.create_user(payload.email, payload.password, payload.displayName)
     except EmailAlreadyRegistered as exc:
         raise HTTPException(status_code=409, detail={
             "code": "EMAIL_ALREADY_REGISTERED", "message": "该邮箱已注册，请直接登录"}) from exc
@@ -367,13 +445,29 @@ async def register(request: RegisterRequest) -> dict[str, Any]:
 
 
 @app.post("/api/auth/login")
-async def login(request: LoginRequest) -> dict[str, Any]:
-    user = await auth_module.authenticate(request.email, request.password)
-    if user is None:
-        # 不区分「账号不存在」与「密码错误」，避免账号枚举。
-        raise HTTPException(status_code=401, detail={
-            "code": "INVALID_CREDENTIALS", "message": "邮箱或密码不正确"})
-    return _session_payload(user)
+async def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
+    # 按 IP 限总尝试次数：这是挡「用一个邮箱反复触发热 PBKDF2 打满 CPU」的那一层。
+    enforce_rate_limit(f"rl:login:ip:{client_ip(request)}", ratelimit_module.login_ip_rule(),
+                       code="LOGIN_RATE_LIMITED", action="登录尝试")
+    # 再按账号限失败次数，挡针对已知邮箱的慢速口令爆破。这一层不依赖 IP，
+    # 所以伪造转发头绕不过去。
+    account_rule = ratelimit_module.login_account_rule()
+    account_key = f"rl:login:account:{payload.email.strip().lower()}"
+    account_state = ratelimit_module.limiter.peek(account_key, account_rule)
+
+    user = await auth_module.authenticate(payload.email, payload.password)
+    if user is not None:
+        # 正确凭据永远是通行证，哪怕这个账号此刻正处于「失败过多」状态。
+        # 否则任何知道邮箱的人连打几次错密码就能把号主锁在门外 —— 拿限流当
+        # 武器比爆破本身廉价得多。放行对攻击者没有好处：他没有正确密码。
+        ratelimit_module.limiter.reset(account_key)
+        return _session_payload(user)
+    if not account_state.allowed:
+        raise _rate_limited(account_state, account_rule, "LOGIN_RATE_LIMITED", "账号登录失败")
+    ratelimit_module.limiter.hit(account_key, account_rule)
+    # 不区分「账号不存在」与「密码错误」，避免账号枚举。
+    raise HTTPException(status_code=401, detail={
+        "code": "INVALID_CREDENTIALS", "message": "邮箱或密码不正确"})
 
 
 @app.get("/api/auth/policy")
@@ -572,12 +666,34 @@ async def create_run(
         except ConversationNotFound as exc:
             raise HTTPException(status_code=404, detail={
                 "code": "CONVERSATION_NOT_FOUND", "message": "对话不存在"}) from exc
+    # 服务端 API Key 是共享钱包，所以配额必须在调用模型**之前**原子占位：
+    # 若等到跑完再统计，并发请求早已一起通过了「还剩 N 次」的检查，额度会被一次刷爆。
+    # 先 peek 一遍只是为了让已经超限的请求立刻被拒，不白跑一次知识库检索。
+    quota = [
+        (f"rl:research:user:{user.id}:hour", ratelimit_module.research_user_hourly_rule()),
+        (f"rl:research:user:{user.id}:day", ratelimit_module.research_user_daily_rule()),
+        ("rl:research:global:day", ratelimit_module.research_global_daily_rule()),
+    ]
+    for key, rule in quota:
+        check_rate_limit(ratelimit_module.limiter.peek(key, rule), rule,
+                         code="RESEARCH_QUOTA_EXCEEDED", action="研究调用")
+    reserved: list[tuple[str, ratelimit_module.RateLimitRule]] = []
+    for key, rule in quota:
+        decision = ratelimit_module.limiter.hit(key, rule)
+        if not decision.allowed:
+            # 占位做到一半失败，把已占的部分退回去，别留下半次扣费。
+            for taken_key, taken_rule in reserved:
+                ratelimit_module.limiter.refund(taken_key, taken_rule)
+            raise _rate_limited(decision, rule, "RESEARCH_QUOTA_EXCEEDED", "研究调用")
+        reserved.append((key, rule))
     knowledge = await knowledge_base.search(request.query, limit=5)
     research_llm = llm_service
+    llm_succeeded = False
     try:
         if request.llm is not None:
             research_llm = llm_service.for_session_request(request.llm.model_dump(exclude_none=True))
         model_output = await research_llm.research(request.query, items, knowledge, request.limit)
+        llm_succeeded = True
     except LLMConfigurationError as exc:
         raise HTTPException(status_code=400, detail={"code": "INVALID_LLM_CONFIGURATION", "message": str(exc)}) from exc
     except LLMNotConfigured as exc:
@@ -586,6 +702,11 @@ async def create_run(
         raise HTTPException(status_code=502, detail={"code": "LLM_RESPONSE_INVALID", "message": str(exc)}) from exc
     except LLMError as exc:
         raise HTTPException(status_code=502, detail={"code": "LLM_UNAVAILABLE", "message": str(exc)}) from exc
+    finally:
+        # 模型没跑成就退还占位：Key 未配置、上游报错、配置非法都不该白扣用户次数。
+        if not llm_succeeded:
+            for key, rule in reserved:
+                ratelimit_module.limiter.refund(key, rule)
     # 模型确实产出了结论，此时才建对话并写入这一轮问答。
     conversation_id = requested_conversation or (await auth_module.create_conversation(user.id, request.query))["id"]
     await auth_module.append_message(
