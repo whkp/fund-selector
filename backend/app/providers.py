@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -54,7 +55,7 @@ class AKShareProvider:
             if rankings is None or rankings.empty:
                 raise RuntimeError("AKShare 基金排行返回空数据")
             # 抓取已经在 to_thread 里跑，但真正耗 CPU 的是解析：目录建索引 +
-            # 500 行逐行构造 Fund。这段是纯同步计算，留在主协程会在冷启动
+            # 全量排行逐行构造 Fund。这段是纯同步计算，留在主协程会在冷启动
             # _warm_up() 和首个列表请求期间占住事件循环，把同一时刻的健康检查
             # 等请求一起拖住 —— 抓取那一步没阻塞，解析这一步却阻塞了，等于白做。
             # 整段挪进线程，只 await 一次拿结果。
@@ -81,7 +82,10 @@ class AKShareProvider:
             for _, row in directory.iterrows()
         } if directory is not None else {}
         result = []
-        for index, row in rankings.head(500).iterrows():
+        # 不再截断 head(500)：主题型基金（如白酒）在全量排行的第 1.8 万位开外，
+        # 截断等于把它们变成检索盲区。全量约 2 万行，内存几十 MB，可承受；
+        # 研究候选池再按相关性取 40 只（main.research_pool），前端浏览列表另设上限。
+        for index, row in rankings.iterrows():
             code = str(row.get("基金代码", "")).zfill(6)
             if not code or code == "000000":
                 continue
@@ -234,6 +238,87 @@ class AKShareProvider:
         )
 
 
+# ---------------------------------------------------------------------------
+# 相关性检索：n-gram 倒排索引
+#
+# 中文没有分词，研究问题又是自然语言整句（"帮我找一只白酒主题的基金"）。
+# 按标点切 token 再做「token 是否是基金名的子串」的匹配什么都命不中——
+# "白酒"被埋在更长的 token 里。改为双向 n-gram：建索引时把基金名称/
+# 主题/标签/经理/公司切成 2-gram 和 3-gram，查询时对问题做同样切分，
+# 命中的 gram 累加权重。这样"白酒"（问题的 2-gram）能撞上
+# "招商中证白酒指数"（名称的 2-gram）。
+#
+# 只排除「基金/管理/有限/公司」这类出现在每家公司名里的通用后缀；
+# "证券""银行""白酒"这类可能就是主题本身的词一律保留。
+# ---------------------------------------------------------------------------
+
+_GENERIC_GRAMS = frozenset({
+    "基金", "管理", "有限", "公司", "股份", "发起", "主题",
+    "基金管", "金管理", "管理有", "理有限", "有限公", "限公司", "份有限", "股份有",
+})
+_NAME_NOISE = re.compile(r"(指数|混合|债券|股票|ETF|LOF|QDII|联接|增强|发起式|定期开放|持有期|滚动持有|[（(][^()（）]*[)）]|[A-Za-z]+$)")
+_PLACEHOLDER = {"未获取", "未标注", ""}
+# 查询侧停用词：问题里的功能词（"回撤比较小"的"比较"、"最好规模别太小"的
+# "最好/规模"）在基金名里撞不出有意义的召回，只会制造噪音 —— 实测"比较"
+# 两字召回了"南方比较优势混合"。这里只收「不会作为主题出现在基金名里」
+# 的词；"白酒""科技""易方达"这类真主题/真品牌一个都不动。
+_QUERY_NOISE = sorted(
+    (
+        "手续费", "怎么样", "怎样", "怎么", "帮我", "帮忙", "想要", "希望", "最好",
+        "适合", "比较", "较小", "较大", "适中", "不要太", "别太", "不要", "一只",
+        "一些", "一下", "回撤", "波动", "规模", "费率", "收益", "稳健", "激进",
+        "保守", "推荐", "挑选", "筛选", "配置", "什么", "哪些", "哪个", "谢谢",
+        "基金", "主题", "的", "了", "吗", "呢", "吧", "啊", "呀", "么", "里", "在",
+    ),
+    key=len, reverse=True,
+)
+_QUERY_NOISE_RE = re.compile("|".join(re.escape(word) for word in _QUERY_NOISE))
+_GRAM_FIELD_WEIGHTS: tuple[tuple[str, int], ...] = (
+    ("name", 3), ("short_name", 3), ("theme", 2), ("manager", 2), ("company", 1),
+)
+
+
+def _text_grams(text: str, weight: int) -> dict[str, int]:
+    cleaned = _NAME_NOISE.sub("", str(text)).strip()
+    if len(cleaned) < 2 or cleaned in _PLACEHOLDER:
+        return {}
+    grams: dict[str, int] = {}
+    for size in (2, 3):
+        for start in range(len(cleaned) - size + 1):
+            gram = cleaned[start:start + size]
+            if gram in _GENERIC_GRAMS:
+                continue
+            grams[gram] = max(grams.get(gram, 0), weight * size)
+    return grams
+
+
+def build_gram_index(funds: list[Fund]) -> dict[str, list[tuple[str, int]]]:
+    """对整个全集建 gram -> [(基金代码, 权重)] 倒排索引。同步函数，调用方放线程。"""
+    index: dict[str, list[tuple[str, int]]] = {}
+    for fund in funds:
+        fund_grams: dict[str, int] = {}
+        for field, weight in _GRAM_FIELD_WEIGHTS:
+            fund_grams.update(_text_grams(getattr(fund, field), weight))
+        for gram, weight in fund_grams.items():
+            index.setdefault(gram, []).append((fund.code, weight))
+    return index
+
+
+def query_relevance_scores(query: str, index: dict[str, list[tuple[str, int]]]) -> dict[str, int]:
+    """用与索引相同的切分方式打分。同步、纯内存，O(问题长度) 量级。"""
+    text = _QUERY_NOISE_RE.sub("", re.sub(r"[\s，。、,;；:：!！?？'\"()（）]+", "", str(query)))
+    scores: dict[str, int] = {}
+    for size in (3, 2):
+        weight_bonus = 2 if size == 3 else 1
+        for start in range(len(text) - size + 1):
+            gram = text[start:start + size]
+            if gram in _GENERIC_GRAMS:
+                continue
+            for code, gram_weight in index.get(gram, ()):
+                scores[code] = scores.get(code, 0) + gram_weight * weight_bonus
+    return scores
+
+
 class DataRepository:
     """In-memory repository with TTL-bounded caches.
 
@@ -245,6 +330,7 @@ class DataRepository:
     def __init__(self, provider: AKShareProvider) -> None:
         self.provider = provider
         self.funds: dict[str, Fund] = {}
+        self._gram_index: dict[str, list[tuple[str, int]]] = {}
         self.histories: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.watchlist: dict[str, dict[str, Any]] = {}
         self.runs: dict[str, dict[str, Any]] = {}
@@ -267,10 +353,16 @@ class DataRepository:
         # Replace the universe atomically so a failed or partial refresh cannot
         # mix stale records into the current public reference dataset.
         self.funds = {item.code: item for item in items}
+        # 索引构建对 2 万只基金要扫几十万次字符串，丢进线程别占事件循环。
+        self._gram_index = await asyncio.to_thread(build_gram_index, items)
         self.histories.clear()
         self._history_fetched_at.clear()
         self._funds_fetched_at = datetime.now(UTC)
         return True
+
+    def relevance_scores(self, query: str) -> dict[str, int]:
+        """按问题对全集做相关性打分，返回 code -> 分数（0 分的基金不在结果里）。"""
+        return query_relevance_scores(query, self._gram_index)
 
     def _funds_are_fresh(self) -> bool:
         if not self.funds or self._funds_fetched_at is None:

@@ -67,7 +67,8 @@ def akshare_like_universe(monkeypatch: pytest.MonkeyPatch) -> None:
     repository.watchlist = {}
     repository.runs = {}
 
-    async def fake_research(query: str, funds: list[Fund], knowledge: list[object], limit: int) -> ModelResearchOutput:
+    async def fake_research(query: str, funds: list[Fund], knowledge: list[object], limit: int,
+                            history: list[dict[str, str]] | None = None) -> ModelResearchOutput:
         return ModelResearchOutput(
             intent=query, themes=[], ambiguities=[], summary="测试结论。",
             ranking=[ModelAssessment(fundCode=fund.code, score=88 - index, fit="匹配", reason="测试", riskFlags=[])

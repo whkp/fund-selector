@@ -42,7 +42,7 @@ class ModelResearchOutput(BaseModel):
     intent: str = Field(min_length=1, max_length=300)
     themes: list[str] = Field(default_factory=list, max_length=10)
     ambiguities: list[str] = Field(default_factory=list, max_length=8)
-    summary: str = Field(min_length=1, max_length=2000)
+    summary: str = Field(min_length=1, max_length=4000)
     ranking: list[ModelAssessment] = Field(default_factory=list, max_length=20)
     followUpQuestions: list[str] = Field(default_factory=list, max_length=8)
 
@@ -143,26 +143,60 @@ class LLMService:
             "message": "模型将根据真实候选数据生成结构化研究结果。" if configured else "请在服务端环境变量配置 LLM。",
         }
 
-    async def research(self, query: str, funds: list[Fund], knowledge: list[KnowledgeChunk], limit: int) -> ModelResearchOutput:
+    async def research(
+        self,
+        query: str,
+        funds: list[Fund],
+        knowledge: list[KnowledgeChunk],
+        limit: int,
+        history: list[dict[str, str]] | None = None,
+    ) -> ModelResearchOutput:
         status = self.status()
         if status["status"] != "READY":
             raise LLMNotConfigured("LLM 未配置：请设置 FUND_COMPASS_LLM_PROVIDER、MODEL、BASE_URL 和 API_KEY")
         compact_funds = [self._compact_fund(fund) for fund in funds]
         kb_context = [{"id": item.chunk_id, "title": item.title, "content": item.content} for item in knowledge]
         system = (
-            "你是基金研究助手。只允许使用用户提供的候选基金事实和知识库片段。"
-            "你不能创建基金、补全缺失字段、编造数字、预测收益或给出买卖指令。"
-            "对于未获取字段必须明确说未获取。summary、reason 和 riskFlags 要说明证据边界。"
+            "你是基金研究助手，服务对象是正在挑选基金的个人投资者。\n"
+            "\n"
+            "## 数据边界（不可违反）\n"
+            "- 只允许使用下面用户消息里给出的候选基金字段和知识库片段。\n"
+            "- 不能创建基金、补全缺失字段、编造数字、预测收益、给出买卖指令。\n"
+            "- 字段缺失时明确说「未获取」，不要用「较低」「尚可」这类没有数字支撑的定性词。\n"
+            "\n"
+            "## 分析方法（内部按此思考，只输出 JSON）\n"
+            "1. 从问题提炼用户真实关注点：主题、风险偏好、期限、费率敏感度、规模偏好。\n"
+            "2. 在候选内部横向对比，收益必须和风险一起看：高收益配大回撤的要指出；\n"
+            "   规模过小（低于 2 亿）有清盘风险，过大（超过百亿）调仓不灵活。\n"
+            "3. 每个结论必须引用具体数字或字段值作证据，\n"
+            "   例如「A 基金 oneYear 32.4%，drawdown -18.2%，在候选中收益第二高但回撤最深」。\n"
+            "4. score 按「与用户问题的契合度」打分，不是按收益高低排座次。\n"
+            "5. 候选里没有与问题主题相关的基金时，在 ambiguities 里明确说明，\n"
+            "   不要拿无关基金硬凑排名；此时 ranking 可以为空数组。\n"
+            "\n"
+            "## summary 写法\n"
+            "- 直接给结论和理由，不要客套开场白，不要复述问题。\n"
+            "- 结构：先一句话结论，再 2~3 条关键对比（引用具体数字），最后说明证据边界。\n"
+            "\n"
             "请只返回 JSON，不要 Markdown，不要输出解释文字。"
             "返回对象的字段名和层级必须与下面这个结构完全一致，不要增加、删除或改名："
             f"{RESEARCH_OUTPUT_SHAPE}。"
             "ranking 中的 fundCode 必须来自候选列表，最多返回用户要求的数量。"
         )
         user = json.dumps({"query": query, "limit": limit, "candidates": compact_funds, "knowledge": kb_context}, ensure_ascii=False)
+        # 历史轮次夹在 system 与本轮 user 之间：让模型知道之前聊过什么，
+        # 追问（「那第二只呢」「换成回撤更小的」）才不会失忆。内容截断防 prompt 膨胀。
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+        for turn in history or []:
+            role = turn.get("role")
+            content = str(turn.get("content", "")).strip()
+            if role in {"user", "assistant"} and content:
+                messages.append({"role": role, "content": content[:600]})
+        messages.append({"role": "user", "content": user})
         payload = {
             "model": self.model,
             "temperature": 0.2,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "messages": messages,
             "response_format": {"type": "json_object"},
         }
         headers = {"Content-Type": "application/json"}
@@ -198,10 +232,16 @@ class LLMService:
 
     @staticmethod
     def _compact_fund(fund: Fund) -> dict[str, Any]:
+        # 这里砍字段要慎重：模型能引用的证据全靠它。旧版只剩收益三件套，
+        # 回撤/波动率/规模/经理/主题全被丢掉，库里明明有，模型却只能说空话。
         return {
-            "fundCode": fund.code, "name": fund.name, "type": fund.type, "risk": fund.risk,
+            "fundCode": fund.code, "name": fund.name, "shortName": fund.short_name,
+            "type": fund.type, "risk": fund.risk, "manager": fund.manager,
+            "managerYears": fund.manager_years, "company": fund.company, "theme": fund.theme,
             "nav": fund.nav, "navDate": fund.nav_date, "ytd": fund.ytd, "oneYear": fund.one_year,
-            "fee": fund.fee, "intake": fund.intake, "source": fund.source,
+            "volatility": fund.volatility, "drawdown": fund.drawdown, "fee": fund.fee,
+            "scale": fund.scale, "tags": fund.tags, "highlights": fund.highlights,
+            "intake": fund.intake, "source": fund.source,
             "sourceType": fund.nav_source_type, "trustLevel": fund.nav_trust_level,
             "caveat": fund.caveat,
         }

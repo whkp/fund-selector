@@ -371,16 +371,21 @@ def filtered(request: ScreenRequest) -> list[Fund]:
     return sorted(result, key=lambda item: (-item.score, item.code))[:request.limit]
 
 
+RESEARCH_POOL_SIZE = 40
+
+
 def research_pool(request: ScreenRequest) -> list[Fund]:
-    """Apply only explicit eligibility constraints; ranking belongs to the model."""
-    result = []
-    for fund in repository.list_funds():
-        passed, _ = eligibility(fund, request.filters)
-        if not passed:
-            continue
-        result.append(fund)
-    # Keep the prompt bounded while preserving the provider's current reference order.
-    return result[:60]
+    """硬约束照旧；池内排序按与问题的相关性优先，而不是数据源的原始顺序。
+
+    旧行为是取符合硬约束的头 60 只 —— 顺序来自 AKShare 排行，与问题无关：
+    问「白酒」时池子里可能一只白酒基金都没有，模型只能在无关基金里硬挑。
+    相关性打分走 repository 的 n-gram 索引（中文没有分词，见 providers.py
+    的说明），没建索引或打分为 0 时按静态分兜底，保证池子永不为空。
+    """
+    eligible = [fund for fund in repository.list_funds() if eligibility(fund, request.filters)[0]]
+    relevance = repository.relevance_scores(request.query)
+    eligible.sort(key=lambda f: (relevance.get(f.code, 0), f.score), reverse=True)
+    return eligible[:RESEARCH_POOL_SIZE]
 
 
 @app.get("/health")
@@ -577,11 +582,18 @@ async def reset_ai() -> Any:
     raise HTTPException(403, detail={"code": "SERVER_SIDE_CONFIGURATION_ONLY", "message": "公开模式只允许通过服务端环境变量切换模型"})
 
 
+BROWSE_LIST_LIMIT = 200
+
+
 @app.get("/api/funds")
 async def funds(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     require_production_data()
     await repository.ensure_funds()
-    return envelope([fund.as_dict() for fund in repository.list_funds()])
+    # 浏览视图：按静态分取前 200。全集已放开到 AKShare 全量排行（约 2 万只，
+    # 供研究与筛选在服务端用），整包发给前端是十几 MB 的 JSON，浏览器吃不消；
+    # 深层的基金通过研究问答按相关性召回，不靠翻这个列表。
+    browse = sorted(repository.list_funds(), key=lambda f: f.score, reverse=True)
+    return envelope([fund.as_dict() for fund in browse[:BROWSE_LIST_LIMIT]])
 
 
 @app.get("/api/funds/{code}")
@@ -675,12 +687,21 @@ async def create_run(
         })
     # 追问时先确认对话归属，避免为一个不存在的对话白跑一次模型。
     requested_conversation = request.conversationId.strip()
+    history: list[dict[str, str]] = []
     if requested_conversation:
         try:
             await auth_module.get_conversation(user.id, requested_conversation)
         except ConversationNotFound as exc:
             raise HTTPException(status_code=404, detail={
                 "code": "CONVERSATION_NOT_FOUND", "message": "对话不存在"}) from exc
+        # 带上最近几轮对话，追问场景下模型才知道之前聊过什么。本轮 query 尚未
+        # 入库，不会和 history 重复；assistant 消息是整段研究摘要，截断到 600 字。
+        prior = await auth_module.list_messages(user.id, requested_conversation, limit=200)
+        for message in prior[-6:]:
+            role = message.get("role")
+            content = str(message.get("content", "")).strip()
+            if role in {"user", "assistant"} and content:
+                history.append({"role": role, "content": content[:600]})
     # 服务端 API Key 是共享钱包，所以配额必须在调用模型**之前**原子占位：
     # 若等到跑完再统计，并发请求早已一起通过了「还剩 N 次」的检查，额度会被一次刷爆。
     # 先 peek 一遍只是为了让已经超限的请求立刻被拒，不白跑一次知识库检索。
@@ -707,7 +728,7 @@ async def create_run(
     try:
         if request.llm is not None:
             research_llm = llm_service.for_session_request(request.llm.model_dump(exclude_none=True))
-        model_output = await research_llm.research(request.query, items, knowledge, request.limit)
+        model_output = await research_llm.research(request.query, items, knowledge, request.limit, history=history)
         llm_succeeded = True
     except LLMConfigurationError as exc:
         raise HTTPException(status_code=400, detail={"code": "INVALID_LLM_CONFIGURATION", "message": str(exc)}) from exc

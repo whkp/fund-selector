@@ -44,7 +44,8 @@ def reset_repository(monkeypatch: pytest.MonkeyPatch) -> None:
     repository.watchlist = {}
     repository.runs = {}
 
-    async def fake_research(query: str, funds: list[Fund], knowledge: list[object], limit: int) -> ModelResearchOutput:
+    async def fake_research(query: str, funds: list[Fund], knowledge: list[object], limit: int,
+                            history: list[dict[str, str]] | None = None) -> ModelResearchOutput:
         return ModelResearchOutput(
             intent=query, themes=["新能源"], ambiguities=[], summary="模型测试结论：仅基于候选快照进行比较。",
             ranking=[ModelAssessment(fundCode=fund.code, score=90 - index, fit="符合用户目标", reason="真实候选字段匹配。", riskFlags=[])
@@ -163,7 +164,8 @@ def test_session_llm_key_is_not_written_to_research_run(monkeypatch: pytest.Monk
         provider = "openai-compatible"
         model = "session-model"
 
-        async def research(self, query: str, funds: list[Fund], knowledge: list[object], limit: int) -> ModelResearchOutput:
+        async def research(self, query: str, funds: list[Fund], knowledge: list[object], limit: int,
+                           history: list[dict[str, str]] | None = None) -> ModelResearchOutput:
             return await fake_session_research(query, funds, knowledge, limit)
 
     monkeypatch.setattr(llm_service, "for_session_request", lambda overrides: SessionService())

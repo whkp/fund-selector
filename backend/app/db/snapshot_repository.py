@@ -62,8 +62,13 @@ class SnapshotRepository:
                 ))
                 written = 0
                 staged: list[tuple[FundRecord, str, Fund]] = []
+                # 全量 universe 约 2 万行，循环里逐行 SELECT 就是 2 万次网络往返，
+                # 对着 Neon 这种跨洋库冷启动要按小时算。一次把 (code -> 行) 全拿回来。
+                existing_by_code: dict[str, FundRecord] = {
+                    row.code: row for row in (await session.scalars(select(FundRecord))).all()
+                }
                 for fund in funds:
-                    record = await session.scalar(select(FundRecord).where(FundRecord.code == fund.code))
+                    record = existing_by_code.get(fund.code)
                     if record is None:
                         record = FundRecord(id=fund.id, code=fund.code, name=fund.name,
                                             short_name=fund.short_name, created_at=now, updated_at=now)
