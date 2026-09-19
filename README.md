@@ -72,6 +72,20 @@ AKShare 数据源状态使用 `GET /api/data-sources/status` 获取；基金目�
 
 **启动时会自动执行 `alembic upgrade head`**（见 `backend/app/db/migrate.py`），手工初始化一般不需要。迁移失败会打印到 stderr，但不会挡住服务启动 —— 基金数据接口仍然可读。
 
+### 部署到临时文件系统的平台时必须换 Postgres
+
+默认库是 SQLite，文件落在 `backend/data/fund-compass.db`。本机或任何有持久磁盘的机器上没问题，但 Render / Railway / Fly 这类平台的容器文件系统是**临时的**：每次部署、以及空闲休眠后唤醒都会重建容器，整个库随之清空。丢的不是行情数据（那些每次都从 AKShare 现拉），而是用户账号、对话、观察列表和风险测评 —— 且没有备份。
+
+> Render 自家的免费 Postgres 只是把这个时间点推到第 30 天（创建满 30 天即删除，14 天宽限），不算解决。用 Neon 或 Supabase 这类不限期免费层。
+
+配一个连接串就行，代码会自行处理异步驱动和 pooler 兼容：
+
+```bash
+export FUND_COMPASS_DATABASE_URL="postgresql://user:pass@host/db?sslmode=require"
+```
+
+连接串可以**原样粘贴**：`app/db/session.py` 里的 `_normalize_database_url` 会补齐 `+asyncpg` 驱动（裸 `postgresql://` 会让服务启动时崩在找不到 psycopg2）、把 `sslmode` 改写成 asyncpg 认的 `ssl`、丢掉 `channel_binding`，并默认关闭预处理语句缓存 —— 后者是 Neon 的 `-pooler` 端点和 pgbouncer 必需的，否则会撞 `DuplicatePreparedStatementError`。迁移仍是启动时自动执行，空库会被建好表。
+
 仍然可以手动执行：
 
 ```bash

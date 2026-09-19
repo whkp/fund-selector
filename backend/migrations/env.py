@@ -7,24 +7,26 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from app.config import config_value
 from app.db import base  # noqa: F401
 from app.db.base import Base
+from app.db.session import database_url
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
-database_url = str(config_value(
-    "server", "database_url", "sqlite+aiosqlite:///./data/fund-compass.db",
-    env_name="FUND_COMPASS_DATABASE_URL",
-))
+
+# 复用 session.database_url()，而不是在这里自己再读一次 config_value ——
+# 那个函数会把平台给的裸 postgresql:// 补成 postgresql+asyncpg://。
+# 两边各读一次的话逻辑会漂移：应用连得上、迁移却崩在找不到 psycopg2，
+# 而迁移跑在启动路径上，等于整个服务起不来。
+DATABASE_URL = database_url()
 
 
 def run_migrations_offline() -> None:
     context.configure(
-        url=database_url,
+        url=DATABASE_URL,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -42,7 +44,7 @@ def do_run_migrations(connection: Connection) -> None:
 
 async def run_async_migrations() -> None:
     configuration = config.get_section(config.config_ini_section, {})
-    configuration["sqlalchemy.url"] = database_url
+    configuration["sqlalchemy.url"] = DATABASE_URL
     connectable = async_engine_from_config(
         configuration, prefix="sqlalchemy.", poolclass=pool.NullPool
     )

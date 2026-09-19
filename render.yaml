@@ -49,10 +49,18 @@ services:
       #    已经存在，要在 Dashboard → Environment 里手动新增这个变量。
       - key: FUND_COMPASS_INVITE_CODE
         sync: false
-      # —— 一个尚未处理的隐患，留此备忘 ——
-      # 默认数据库是 SQLite（backend/data/fund-compass.db），而 Render 免费版的
-      # 文件系统是临时的：**每次重新部署都会清空整个库**，用户账号、对话、
-      # 观察列表一并丢失。上面两个密钥解决了「掉登录态」，但解决不了「账号没了」。
-      # 要真正持久化必须换 Postgres：在 Render 建库后把连接串配到
-      # FUND_COMPASS_DATABASE_URL（代码已含 asyncpg 驱动，Alembic 迁移也已就位）。
-      # 免费版同样没有持久磁盘，挂载卷这条路在此平台不成立。
+      # ── 数据库：必须换成外部 Postgres，不能用默认的 SQLite ──────────────
+      # 默认库是 SQLite（backend/data/fund-compass.db），而 Render 的文件系统是
+      # 临时的：每次部署、以及空闲 15 分钟休眠后唤醒，容器都会重建，整个库清空。
+      # 后果不是丢行情数据（那些每次从 AKShare 现拉），而是用户账号、对话、
+      # 观察列表、风险测评一起消失，且没有备份。
+      #
+      # ⚠️ 别用 Render 自家的免费 Postgres —— 它只是把「每次部署丢」变成
+      #    「第 30 天丢」（创建后 30 天删除，14 天宽限）。用 Neon / Supabase
+      #    这类不限期免费层，把连接串填到这里，原文粘贴即可：
+      #      postgresql://user:pass@host/db?sslmode=require
+      #    代码会自行补齐 asyncpg 驱动、改写 sslmode、关闭预处理语句缓存
+      #    （Neon 的 -pooler / pgbouncer 端点必需），见 app/db/session.py。
+      #    首次启动会自动跑 Alembic 迁移建表。
+      - key: FUND_COMPASS_DATABASE_URL
+        sync: false
