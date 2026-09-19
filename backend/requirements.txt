@@ -1,3 +1,22 @@
+# 声明性依赖（区间约束）—— **开发用，不用于部署**。
+#
+# 部署请用 backend/requirements.lock（精确版本，Linux/CPython 3.13）。
+# 两者分工：
+#   - 本文件写允许的范围，便于看清「哪些版本是兼容的」
+#   - lock 写实际钉死的版本，保证每次部署装到完全一样的包
+#
+# 目标 Python 版本是 **3.13**（见仓库根的 `.python-version`）。
+# 注意不能下调到 3.11：numpy 2.5.3 要求 Python >= 3.12，在 3.11 上会被
+# 静默替换成 2.4.x —— 那就和本地验证过的版本不是同一套了。
+#
+# 升级流程：
+#   1. 改这里的区间
+#   2. `.venv/Scripts/python.exe -m pip install -U -r backend/requirements.txt`
+#   3. 跑全量测试 + 端到端研究请求
+#   4. 重新生成 backend/requirements.lock（生成方式见该文件头部），确认 diff
+#
+# pytest 是测试依赖，一并留在本文件里，因此也会进部署镜像。
+# 体积代价很小（约几 MB），换来的是「测试环境与部署环境同源」。
 fastapi>=0.115,<1
 uvicorn[standard]>=0.34,<1
 pydantic-settings>=2.7,<3

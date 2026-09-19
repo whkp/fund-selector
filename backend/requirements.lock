@@ -1,0 +1,96 @@
+# 部署用的精确依赖清单 —— Linux / CPython 3.13 / glibc >= 2.28。
+#
+# 用法：`pip install -r backend/requirements.lock`
+#   - Dockerfile 与 render.yaml 的 buildCommand 都指向本文件
+#   - Windows 本地开发请用 backend/requirements.txt，**不要**用本文件
+#     （它含 uvloop / py-mini-racer / akracer，这些在 Windows 上装不了）
+#
+# 为什么不是 `pip freeze`：
+#   requirements.txt 用的是 `>=x,<y` 区间，重装结果不可复现。akshare 靠爬
+#   东财 `_em` 接口取数，上游一改版它就跟着发版 —— 同一天两次安装可能拿到
+#   不同版本。实测本地装的是 akshare 1.18.94，而声明只要求 `>=1.16,<2`。
+#
+# 为什么不能直接拿 Windows 的 freeze 当部署清单（实测结论）：
+#   Windows 上装得到的版本，有一批在 Linux 上根本不存在：
+#     - greenlet 3.5.5 的 Linux wheel 标签是 manylinux_2_28，不是 manylinux2014
+#     - cffi 2.1.1 在 Linux 上只有 2.0.0b1
+#   直接部署会 "No matching distribution found"，比版本漂移更糟。
+#
+# 生成方式（uv 的跨平台解析 + 本地版本约束）：
+#   uv pip compile backend/requirements.txt \
+#       -c <本地 freeze 作为 constraints> \
+#       --python-platform x86_64-manylinux_2_28 --python-version 3.13 \
+#       --no-annotate --no-header
+#   约束取自本地 venv（Python 3.13.14），让 uv 优先采用本地已验证的版本。
+#
+# 实测结果：与本地 Windows 的共同包，**版本差异 0 个**。差异只在包集合：
+#   - 仅 Linux：uvloop（uvicorn[standard] 的 POSIX 依赖）、py-mini-racer、
+#     akracer（akshare 在 POSIX 上的依赖，替代 Windows 侧的 mini-racer）
+#   - 仅本地：colorama（Windows 终端着色）、mini-racer、pillow、qrcode
+#
+# ⚠️ 局限：本清单保证在目标平台「装得上」，但**未在 Linux 上实跑过**。
+#    每次改动都应重新生成并确认 diff 只含预期变化。
+#
+# 共 62 个包。
+aiosqlite==0.22.1
+akracer==0.0.14
+akshare==1.18.94
+alembic==1.19.2
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+asyncpg==0.31.0
+beautifulsoup4==4.15.0
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.1
+click==8.5.0
+curl-cffi==0.16.3
+decorator==5.3.1
+et-xmlfile==2.0.0
+fastapi==0.141.1
+greenlet==3.5.5
+h11==0.16.0
+html5lib==1.1
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.19
+iniconfig==2.3.0
+jsonpath==0.82.2
+lxml==6.1.3
+mako==1.4.1
+markupsafe==3.0.3
+numpy==2.5.3
+openpyxl==3.1.5
+packaging==26.3
+pandas==2.3.3
+pluggy==1.6.0
+py-mini-racer==0.6.0
+pycparser==3.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+pydantic-settings==2.15.0
+pygments==2.21.0
+pytest==8.4.2
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.3
+pytz==2026.3.post1
+pyyaml==6.0.3
+requests==2.34.2
+six==1.17.0
+soupsieve==2.9.2
+sqlalchemy==2.0.52
+starlette==1.6.0
+tabulate==0.10.0
+tqdm==4.70.1
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+tzdata==2026.3
+urllib3==2.7.0
+uvicorn==0.52.4
+uvloop==0.22.1
+watchfiles==1.2.0
+webencodings==0.6.1
+websockets==17.1
+xlrd==2.0.2

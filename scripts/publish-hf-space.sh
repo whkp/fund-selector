@@ -38,6 +38,15 @@ rm -f "$STAGE/backend/alembic.ini" "$STAGE/backend/pyproject.toml"
 # 线上改用 Space 的 Settings → Variables and secrets 配 FUND_COMPASS_LLM_*。
 rm -f "$STAGE/config/fund-compass.json"
 
+# 同理，会话密钥与邀请码也必须由 Space 的 Variables and secrets 提供，
+# 否则会落到「文件缺失 → 自动重新生成」分支：Space 的文件系统是临时的，
+# 每次重启都换 JWT 密钥（全员掉线）和邀请码（已发出去的码作废）。
+# 要配的两个变量：FUND_COMPASS_JWT_SECRET、FUND_COMPASS_INVITE_CODE。
+#
+# 另外：下面会删掉 alembic.ini 和 migrations/，所以这个 Space 上
+# app/db/migrate.py 会走「回退到 create_all」分支 —— 能建全表，但
+# **不会 ALTER 已存在的表**。结构变更请在有迁移的环境里先验证。
+
 # backend/data/ 里是 .invite-code（注册准入凭证）、.jwt-secret 和 fund-compass.db
 # （含用户邮箱与密码哈希）。Space 默认公开，这几个文件一旦推上去等于把门敞开。
 # 进程启动时会自动重建它们（见 auth.py 的 _load_or_create_invite_codes / load_or_create_secret）。

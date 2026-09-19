@@ -2,7 +2,9 @@ services:
   - type: web
     name: fund-compass-api
     runtime: python
-    buildCommand: pip install -r backend/requirements.txt
+    # 用 lock 而不是 requirements.txt：后者是区间约束，重装结果不可复现。
+    # lock 的生成方式、平台假设与局限见 backend/requirements.lock 头部注释。
+    buildCommand: pip install -r backend/requirements.lock
     startCommand: uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
@@ -31,3 +33,26 @@ services:
         sync: false
       - key: FUND_COMPASS_KNOWLEDGE_BASE_PATH
         value: ""
+      # ── 会话密钥与邀请码：必须由平台提供，不能依赖文件系统 ──────────────
+      # auth.py 在文件缺失时会**重新生成** JWT 密钥和邀请码。Render 的文件系统
+      # 对每次部署都是全新的，所以不配这两个变量的后果是：
+      #   - 每次部署换 JWT 密钥 → 所有已登录用户被踢下线
+      #   - 每次部署换邀请码   → 已发出去的邀请码全部作废
+      #
+      # generateValue：Render 生成 base64 编码的 256-bit 随机值；已存在则不覆盖，
+      # 因此跨部署保持不变。密钥不需要人知道，随机是最强的选择。
+      - key: FUND_COMPASS_JWT_SECRET
+        generateValue: true
+      # sync: false → 值不写进仓库，在 Render 控制台填。
+      # 邀请码必须是人类可输入、可转发的短码，所以不能用 generateValue 的 base64。
+      # ⚠️ 注意：sync: false 只在 Blueprint **首次创建**时弹出填写提示。若服务
+      #    已经存在，要在 Dashboard → Environment 里手动新增这个变量。
+      - key: FUND_COMPASS_INVITE_CODE
+        sync: false
+      # —— 一个尚未处理的隐患，留此备忘 ——
+      # 默认数据库是 SQLite（backend/data/fund-compass.db），而 Render 免费版的
+      # 文件系统是临时的：**每次重新部署都会清空整个库**，用户账号、对话、
+      # 观察列表一并丢失。上面两个密钥解决了「掉登录态」，但解决不了「账号没了」。
+      # 要真正持久化必须换 Postgres：在 Render 建库后把连接串配到
+      # FUND_COMPASS_DATABASE_URL（代码已含 asyncpg 驱动，Alembic 迁移也已就位）。
+      # 免费版同样没有持久磁盘，挂载卷这条路在此平台不成立。

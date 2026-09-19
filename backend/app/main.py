@@ -21,6 +21,7 @@ from . import ratelimit as ratelimit_module
 from . import watchlist as watchlist_module
 from .auth import ConversationNotFound, EmailAlreadyRegistered, current_user
 from .config import config_value
+from .db import migrate as migrate_module
 from .db.base import UserRecord
 from .db.session import database_health
 from .knowledge import build_knowledge_base
@@ -60,10 +61,12 @@ async def _warm_up() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     try:
-        await auth_module.ensure_auth_schema()
+        print(f"[startup] {await migrate_module.ensure_schema()}", file=sys.stderr)
     except Exception as exc:  # pragma: no cover - 取决于部署环境
-        # 建表失败必须可见，但不能挡住整个服务：基金数据接口仍可读。
-        print(f"[startup] 认证表初始化失败：{exc}", file=sys.stderr)
+        # 迁移失败必须可见，但不能挡住整个服务：基金数据接口仍可读。
+        # 注意这里**不**回退到 create_all —— 迁移失败说明结构变更没落地，
+        # 静默降级只会把问题推迟到第一次查询报错。
+        print(f"[startup] 数据库 schema 迁移失败：{exc}", file=sys.stderr)
     # 这里只打印掩码：完整邀请码一旦进了日志，就会流向任何能看到运行日志的人，
     # 在云平台上那就是全部项目成员 —— 邀请制当场失效。要抄码请用
     # `scripts/show-invite-code.cmd`，它读的是同一个落盘文件。

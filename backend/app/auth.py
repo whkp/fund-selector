@@ -233,7 +233,13 @@ def _patch_legacy_users_table(sync_connection: Any) -> None:
 
 
 async def ensure_auth_schema() -> None:
-    """启动时建表。与正式的 Alembic 迁移并存，二者结果一致。"""
+    """建表兜底，**不是**启动时的主路径。
+
+    正常情况下 `app.db.migrate.ensure_schema()` 会跑 Alembic。只有迁移环境
+    不完整时（HF Space 的发布脚本会删掉 `alembic.ini` 和 `migrations/`）才
+    落到这里。它只保证"表存在"，不保证"表是最新的" —— `create_all` 从不
+    ALTER 已存在的表。所以任何结构变更都必须写进迁移，别指望这个函数兜住。
+    """
     engine = get_engine()
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)

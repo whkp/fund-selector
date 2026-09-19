@@ -4,7 +4,7 @@
 #   docker build -t fund-compass-api .
 #   docker run --rm -p 7860:7860 fund-compass-api
 #   curl http://127.0.0.1:7860/health
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -14,8 +14,11 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 依赖单独成层：只改业务代码时不会触发重新安装。
-COPY backend/requirements.txt ./backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt
+# 用 requirements.lock（精确版本）而不是 requirements.txt（区间约束）：
+# 后者重装结果不可复现，akshare 这类爬取型库尤其明显 —— 上游一改版就跟着
+# 发新版，同一天两次安装可能拿到不同版本。lock 的生成方式与平台假设见该文件头部。
+COPY backend/requirements.lock ./backend/requirements.lock
+RUN pip install --no-cache-dir -r backend/requirements.lock
 
 # 保持仓库原有的相对路径，使 backend/app/config.py 的 PROJECT_ROOT 解析到 /app，
 # 从而正确找到 config/fund-compass.json。

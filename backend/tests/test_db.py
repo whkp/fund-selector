@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
@@ -7,6 +8,11 @@ from sqlalchemy import inspect
 import app.db.session as session_module
 from app.db.base import Base
 from app.db.session import database_health
+
+# `alembic.ini` 里的 script_location / prepend_sys_path 都是相对值，直接
+# `Config("alembic.ini")` 就等于把测试的正确性押在调用者的 cwd 上 ——
+# 从仓库根跑和从 backend/ 跑结果不同，CI 上尤其容易踩。统一用绝对路径。
+BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 
 def test_database_health_and_metadata_create(tmp_path, monkeypatch):
@@ -30,8 +36,9 @@ def test_database_health_and_metadata_create(tmp_path, monkeypatch):
 def test_initial_migration_upgrade_and_downgrade(tmp_path, monkeypatch):
     db_path = tmp_path / "migration.db"
     monkeypatch.setenv("FUND_COMPASS_DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
-    config = Config("alembic.ini")
-    config.set_main_option("script_location", "migrations")
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    config.set_main_option("prepend_sys_path", str(BACKEND_DIR))
     command.upgrade(config, "head")
     command.downgrade(config, "base")
     assert db_path.exists()

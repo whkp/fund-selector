@@ -58,14 +58,18 @@ def _reset_engine() -> None:
 
 @pytest.fixture(scope="session", autouse=True)
 def prepare_schema():
-    """建一次表。TestClient 不进入 lifespan，所以不能依赖应用启动钩子。"""
+    """建一次表。TestClient 不进入 lifespan，所以不能依赖应用启动钩子。
+
+    走的是应用同一条路径（Alembic 迁移），这样迁移脚本本身也在测试覆盖里；
+    只调 create_all 的话，写坏的迁移直到部署才会暴露。
+    """
     import asyncio
 
-    from app.auth import ensure_auth_schema
+    from app.db.migrate import ensure_schema
     from app.db.session import get_engine
 
     async def create() -> None:
-        await ensure_auth_schema()
+        await ensure_schema()
         # 建表用的 event loop 马上要结束，先释放连接池，避免连接被跨 loop 复用。
         await get_engine().dispose()
 
