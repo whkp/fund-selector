@@ -48,6 +48,24 @@ class ModelResearchOutput(BaseModel):
     followUpQuestions: list[str] = Field(default_factory=list, max_length=8)
 
 
+# response_format={"type": "json_object"} 只保证「是合法 JSON」，不保证字段名。
+# 不在 prompt 里写清结构，模型就会自创字段（实测 qwen-plus / qwen3-max / qwen-flash /
+# qwen3.8-flash 全部偏离），随后在 ModelResearchOutput 校验处失败。
+# 这段结构描述必须与 ModelResearchOutput 保持同步。
+RESEARCH_OUTPUT_SHAPE = (
+    '{"intent": "字符串：复述用户的研究意图", '
+    '"themes": ["字符串：关注主题"], '
+    '"ambiguities": ["字符串：需求中不明确之处，没有则为空数组"], '
+    '"summary": "字符串：研究结论摘要", '
+    '"ranking": [{"fundCode": "字符串：必须是候选列表中的基金代码", '
+    '"score": "0-100 的整数", '
+    '"fit": "字符串：该基金与用户偏好的适配理由", '
+    '"reason": "字符串：判断依据与证据边界", '
+    '"riskFlags": ["字符串：风险提示与未获取字段"]}], '
+    '"followUpQuestions": ["字符串：建议用户补充的信息"]}'
+)
+
+
 class LLMService:
     """OpenAI-compatible research adapter with strict, fact-grounded output."""
 
@@ -126,8 +144,11 @@ class LLMService:
         system = (
             "你是基金研究助手。只允许使用用户提供的候选基金事实和知识库片段。"
             "你不能创建基金、补全缺失字段、编造数字、预测收益或给出买卖指令。"
-            "请只返回 JSON，不要 Markdown。ranking 中的 fundCode 必须来自候选列表，最多返回用户要求的数量。"
             "对于未获取字段必须明确说未获取。summary、reason 和 riskFlags 要说明证据边界。"
+            "请只返回 JSON，不要 Markdown，不要输出解释文字。"
+            "返回对象的字段名和层级必须与下面这个结构完全一致，不要增加、删除或改名："
+            f"{RESEARCH_OUTPUT_SHAPE}。"
+            "ranking 中的 fundCode 必须来自候选列表，最多返回用户要求的数量。"
         )
         user = json.dumps({"query": query, "limit": limit, "candidates": compact_funds, "knowledge": kb_context}, ensure_ascii=False)
         payload = {
