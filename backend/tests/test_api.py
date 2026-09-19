@@ -8,8 +8,8 @@ from fastapi.testclient import TestClient
 os.environ["FUND_COMPASS_AKSHARE_ENABLED"] = "false"
 os.environ["FUND_COMPASS_MODE"] = "REFERENCE"
 
-from app.llm import ModelAssessment, ModelResearchOutput
 import app.main as main_module
+from app.llm import ModelAssessment, ModelResearchOutput
 from app.main import app, llm_service, repository
 from app.models import Fund
 

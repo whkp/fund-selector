@@ -6,6 +6,8 @@
 `subject`/`role`/`created_at`，需要补上登录相关列。
 """
 
+from contextlib import suppress
+
 import sqlalchemy as sa
 from alembic import op
 
@@ -53,7 +55,6 @@ def downgrade() -> None:
         existing = {column["name"] for column in inspector.get_columns("users")}
         for name in USER_COLUMNS:
             if name in existing:
-                try:
+                with suppress(Exception):
+                    # 老 SQLite 不支持 DROP COLUMN；能删就删，删不掉也不影响新代码读取。
                     op.drop_column("users", name)
-                except Exception:  # pragma: no cover - SQLite 老版本不支持 DROP COLUMN
-                    pass

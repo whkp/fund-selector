@@ -8,7 +8,8 @@ from __future__ import annotations
 import re
 import secrets
 import uuid
-from datetime import datetime, timezone
+from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +55,7 @@ class ConversationNotFound(Exception):
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def token_ttl_seconds() -> int:
@@ -118,10 +119,9 @@ def _load_or_create_invite_codes() -> list[str]:
         # 长度又短到能从启动日志里手抄给别人。
         value = secrets.token_urlsafe(12)
         path.write_text(value + "\n", encoding="utf-8")
-        try:
+        with suppress(OSError):
+            # Windows 上 chmod 基本是空操作；权限收紧失败不该让邀请码生成失败。
             path.chmod(0o600)
-        except OSError:
-            pass
         return [value]
     except OSError:
         # 只读文件系统等极端情况：本次运行依然封闭，只是重启后会换码。

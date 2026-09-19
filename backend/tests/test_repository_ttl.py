@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from app.models import Fund
 from app.providers import DataRepository
@@ -42,7 +42,7 @@ class FakeProvider:
         self.list_calls += 1
         return [] if self.fail else self.funds
 
-    async def history(self, code, period):  # noqa: ARG002
+    async def history(self, code, period):
         self.history_calls += 1
         return [] if self.fail else self.history_records
 
@@ -61,7 +61,7 @@ def test_ensure_funds_refetches_after_ttl_expires():
         assert provider.list_calls == 1
 
         # 过期后必须重新拉取。
-        repository._funds_fetched_at = datetime.now(timezone.utc) - timedelta(seconds=3601)
+        repository._funds_fetched_at = datetime.now(UTC) - timedelta(seconds=3601)
         assert await repository.ensure_funds() is True
         assert provider.list_calls == 2
 
@@ -76,7 +76,7 @@ def test_ensure_funds_serves_stale_snapshot_when_upstream_fails():
         assert provider.list_calls == 1
 
         provider.fail = True
-        repository._funds_fetched_at = datetime.now(timezone.utc) - timedelta(seconds=100_000)
+        repository._funds_fetched_at = datetime.now(UTC) - timedelta(seconds=100_000)
         assert await repository.ensure_funds() is True
         assert provider.list_calls == 2
         # 上游失败时旧快照仍可服务。
@@ -99,7 +99,7 @@ def test_history_refetches_after_ttl_expires():
         assert provider.history_calls == 1
 
         repository._history_fetched_at[("000001", "1年")] = (
-            datetime.now(timezone.utc) - timedelta(seconds=3601)
+            datetime.now(UTC) - timedelta(seconds=3601)
         )
         await repository.history("000001", "1年")
         assert provider.history_calls == 2

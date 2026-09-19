@@ -1,11 +1,17 @@
 import asyncio
-from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 
 import app.db.session as session_module
-from app.db.base import Base, FundProfileSnapshot, FundRecord, JobRun, OutboxEvent, RawDataSnapshot
-from app.db.base import FundNavSnapshot
+from app.db.base import (
+    Base,
+    FundNavSnapshot,
+    FundProfileSnapshot,
+    FundRecord,
+    JobRun,
+    OutboxEvent,
+    RawDataSnapshot,
+)
 from app.db.nav_repository import NavSnapshotRepository
 from app.db.snapshot_repository import SnapshotRepository
 from app.models import Fund

@@ -23,16 +23,31 @@
 
 ## 运行
 
+环境要求：Node.js 20+、Python 3.13（精确版本见仓库根 `.python-version`，与 `Dockerfile` 一致）。
+
 ```bash
-npm install --cache /private/tmp/fund-compass-npm-cache
+npm install
 ```
+
+创建并激活虚拟环境后安装后端依赖：
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # macOS / Linux
+pip install -r backend/requirements.txt
+```
+
+> `backend/requirements.txt` 写的是版本区间，供开发使用；部署走 `backend/requirements.lock`（精确版本）。两者分工见文件头部注释。
 
 在一个终端启动 FastAPI（编辑 `config/fund-compass.json` 即可完成常规配置；未配置模型时基金浏览仍可用，但点击研究会返回配置提示）：
 
 ```bash
-FUND_COMPASS_MODE=REFERENCE \
-FUND_COMPASS_AKSHARE_ENABLED=true \
-.venv/bin/python backend/run.py
+# Windows
+cd backend && ..\.venv\Scripts\python.exe run.py
+
+# macOS / Linux
+cd backend && ../.venv/bin/python run.py
 ```
 
 配置模板见 `config/fund-compass.example.json`。实际的 `config/fund-compass.json` 已加入 `.gitignore`，API Key 不会被提交。只有在需要临时覆盖配置或部署到托管平台时，才使用 `FUND_COMPASS_*` 环境变量；环境变量优先级高于配置文件。
@@ -45,35 +60,53 @@ npm run dev -- --port 4173
 
 浏览器访问 `http://127.0.0.1:4173/`，前端会通过 Vite 代理请求 `http://127.0.0.1:8080` 的 FastAPI。API 或 AKShare 不可用时，页面显示错误/空状态，不会展示模拟基金。
 
-Reference 模式默认只读。公网部署至少应保持 `FUND_COMPASS_PUBLIC_WRITE_ENABLED=false`，并将 `FUND_COMPASS_PUBLIC_RESEARCH_ENABLED` 设为 `false`，待认证和限流完成后再开放匿名研究。
+Reference 模式默认只读。**公网部署至少应保持 `FUND_COMPASS_PUBLIC_WRITE_ENABLED=false`。**
+
+匿名研究的开关是 `FUND_COMPASS_PUBLIC_RESEARCH_ENABLED`，当前部署里为 `true`（见 `render.yaml`）：账号体系与按用户限流都已经上线，模型调用按登录用户计配额，不再需要靠关掉这个开关来挡住匿名刷模型。注意这个开关由 `create_run` 在**认证之后**检查，配成 `false` 时连登录用户也会被 403。
 
 `PRODUCTION` 模式不会因为修改模式变量就自动获得生产数据。只有在已接入并审核生产数据源后，才设置 `FUND_COMPASS_PRODUCTION_DATA_READY=true`；否则 API 会返回 `PRODUCTION_DATA_NOT_READY`。
 
 AKShare 数据源状态使用 `GET /api/data-sources/status` 获取；基金目录/排行刷新使用 `POST /api/data/funds/refresh`。
 
-数据库骨架已包含 Alembic 迁移和独立基金目录 Worker。首次初始化本地数据库：
+## 数据库
+
+**启动时会自动执行 `alembic upgrade head`**（见 `backend/app/db/migrate.py`），手工初始化一般不需要。迁移失败会打印到 stderr，但不会挡住服务启动 —— 基金数据接口仍然可读。
+
+仍然可以手动执行：
 
 ```bash
 cd backend
-../.venv/bin/alembic upgrade head
-../.venv/bin/python -m app.workers.scheduler
+..\.venv\Scripts\python.exe -m alembic upgrade head
+..\.venv\Scripts\python.exe -m app.workers.scheduler
 ```
+
+> `Base.metadata.create_all` 只建缺失的表，**从不 ALTER 已存在的表**。任何结构变更都必须写进迁移脚本，否则线上老库会静默停留在旧结构。
 
 Worker 会把目录结果写入 raw/profile 快照、任务表和 Outbox；相同 Provider 内容 hash 的重复同步会返回 `UNCHANGED`，不会重复写入同一份快照。
 
 ## 验证
 
 ```bash
-.venv/bin/python -m pytest -q backend/tests
+# 后端：从 repo 根或 backend/ 目录跑都可以
+.venv\Scripts\python.exe -m pytest backend/tests -q
+.venv\Scripts\python.exe -m ruff check backend/
+
+# 前端
 npm run typecheck
 npm run build
 git diff --check
 ```
 
+CI（`.github/workflows/ci.yml`）在每次 push 到 `main` 和每个 PR 上跑这三项：后端 `pytest` + `ruff check`，前端 `vue-tsc` + `vite build`。
+
 构建产物位于 `dist/`。
 
 ## 公网后端
 
-前端产物是纯静态的（`dist/`），可部署到任意静态托管平台。静态托管无法承载 FastAPI、AKShare 或 LLM API，需另行部署后端；仓库提供了 `render.yaml`，可在 Render 以 Python 原生进程部署，不需要 Docker。部署后把后端 HTTPS 地址配置为前端构建变量 `VITE_API_BASE`。后端的 LLM Key 只配置在后端的 Secret 环境变量中，不暴露给前端。
+**当前是前后端同源部署**：`backend/app/main.py` 在检测到仓库根存在 `dist/` 时，会把它挂到 `/`（注册在所有 API 路由之后）。一个进程同时提供 API 和界面，浏览器全程只面对一个 origin，不需要 CORS 协商，隧道也只需要暴露一个端口。
+
+前端产物是纯静态文件，理论上也可以单独托管到任意静态平台，但那样后端（FastAPI + AKShare + LLM 调用）必须另行部署，并且需要给前端构建注入 `VITE_API_BASE` 指向后端地址。当前部署没有走这条路。
+
+仓库提供了 `render.yaml`，可在 Render 以 Python 原生进程部署，不需要 Docker。后端的 LLM Key 只配置在后端的 Secret 环境变量中，不暴露给前端。
 
 > 配置 `VITE_API_BASE` 时请填写自己部署的服务地址。`fund-compass-api.onrender.com` 属于另一个项目，不是本仓库后端。

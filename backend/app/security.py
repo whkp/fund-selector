@@ -18,6 +18,7 @@ import re
 import secrets
 import time
 from collections.abc import Iterable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -186,10 +187,9 @@ def load_or_create_secret(path: Path) -> str:
                 return existing
         value = secrets.token_urlsafe(48)
         path.write_text(value, encoding="utf-8")
-        try:
+        with suppress(OSError):
+            # 同上：权限收紧失败不影响密钥可用性。
             path.chmod(0o600)
-        except OSError:
-            pass
         return value
     except OSError:
         # 只读文件系统等极端情况下退回进程内密钥：本次运行可用，重启后需重新登录。

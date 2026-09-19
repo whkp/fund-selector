@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<9"]
+test = ["pytest>=8,<9", "ruff>=0.16,<1"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -28,3 +28,26 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+# 规则集显式写出来，不吃 ruff 的版本默认值 —— 默认值会随版本变化，
+# 而 CI 的判定标准必须是确定的，否则哪天升个 ruff 就突然一片红。
+#
+# 特意**没有**启用的两组：
+#   S   （bandit）：S101 会把测试里几百个 assert 全报成「用了断言」，
+#        噪音远大于价值；本项目也没有对外暴露的输入解析面要它来兜。
+#   RUF：RUF001/002/003 是「易混淆的 Unicode 字符」，对中文注释和全角
+#        标点属于结构性误报 —— 这个仓库本来就是中文注释。
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "BLE", "LOG", "RET"]
+ignore = [
+    # FastAPI 的依赖注入只能这么写：Depends() 放在默认参数位置是框架用法，
+    # 不是「在默认值里调用函数」这类 bug。
+    "B008",
+    # 中文注释按字符计数，100 字符大约只等于 50 个汉字，注释行极易超限。
+    # 行宽交给编辑器和审阅，不用来卡 CI。
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里断言失败就该让异常冒出来，这是 pytest 的正常用法。
+"tests/*" = ["BLE001", "SIM105"]
