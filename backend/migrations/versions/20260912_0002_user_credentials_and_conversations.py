@@ -38,7 +38,9 @@ def upgrade() -> None:
                 op.add_column("users", sa.Column(name, column_type, nullable=True))
         op.execute("UPDATE users SET email = subject WHERE email IS NULL OR email = ''")
         op.execute("UPDATE users SET display_name = email WHERE display_name IS NULL")
-        op.execute("UPDATE users SET is_active = 1 WHERE is_active IS NULL")
+        # 不能写 `= 1`：Postgres 的 boolean 严格区分类型，直接报
+        # DatatypeMismatchError。TRUE 关键字两边方言都认（SQLite 3.23+，2018 年）。
+        op.execute("UPDATE users SET is_active = TRUE WHERE is_active IS NULL")
 
     # 建出对话表（以及任何尚不存在的表）。已存在的表会被跳过。
     Base.metadata.create_all(bind=bind)
