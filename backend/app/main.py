@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from . import auth as auth_module
 from . import ratelimit as ratelimit_module
 from . import watchlist as watchlist_module
+from .agent_service import AgentResearchService
 from .auth import ConversationNotFound, EmailAlreadyRegistered, current_user
 from .config import config_value
 from .db import migrate as migrate_module
@@ -48,6 +49,9 @@ provider = AKShareProvider()
 repository = DataRepository(provider)
 llm_service = LLMService()
 knowledge_base = build_knowledge_base()
+# Agent 模式（tau harness 多轮工具循环）默认关闭；llm.agent_mode /
+# FUND_COMPASS_LLM_AGENT_MODE 打开且 LLM 就绪时，研究走真实工具调用。
+agent_research = AgentResearchService(llm_service, repository, knowledge_base)
 
 
 async def _warm_up() -> None:
@@ -725,10 +729,23 @@ async def create_run(
     knowledge = await knowledge_base.search(request.query, limit=5)
     research_llm = llm_service
     llm_succeeded = False
+    agent_used = False
+    agent_trace: list[dict[str, str]] = []
     try:
-        if request.llm is not None:
-            research_llm = llm_service.for_session_request(request.llm.model_dump(exclude_none=True))
-        model_output = await research_llm.research(request.query, items, knowledge, request.limit, history=history)
+        if request.llm is not None or not agent_research.enabled:
+            # 会话级自定义端点不保证支持 function calling，一律走旧单轮链路。
+            if request.llm is not None:
+                research_llm = llm_service.for_session_request(request.llm.model_dump(exclude_none=True))
+            model_output = await research_llm.research(request.query, items, knowledge, request.limit, history=history)
+        else:
+            # Agent 模式：模型自主调工具取真实数据。失败时降级到旧链路重跑，
+            # 而不是直接报错 —— agent 可能已消耗数轮模型调用，降级是最后一搏。
+            try:
+                model_output, agent_trace = await agent_research.run_research(request.query, history, request.limit)
+                research_llm = agent_research
+                agent_used = True
+            except LLMError:
+                model_output = await research_llm.research(request.query, items, knowledge, request.limit, history=history)
         llm_succeeded = True
     except LLMConfigurationError as exc:
         raise HTTPException(status_code=400, detail={"code": "INVALID_LLM_CONFIGURATION", "message": str(exc)}) from exc
@@ -759,7 +776,15 @@ async def create_run(
                                      "reason": assessment.reason, "highlights": [assessment.fit],
                                      "caveat": "；".join(assessment.riskFlags) or original.caveat}), assessment))
     run_id = f"run_{uuid.uuid4().hex[:12]}"
-    run = {"runId": run_id, "status": "COMPLETED", "mode": f"{MODE}_LLM_RESEARCH",
+    static_trace = [{"event": "plan_created", "title": "理解研究目标", "detail": model_output.intent, "status": "COMPLETED"},
+                    {"event": "knowledge_retrieved", "title": "检索研究知识库", "detail": f"检索到 {len(knowledge)} 个可引用片段。", "status": "COMPLETED"},
+                    {"event": "tool_completed", "title": "检索真实候选", "detail": f"从 {MODE} AKShare 数据快照取得 {len(items)} 只符合硬约束的候选。{unverified_note(items, request.filters)}", "status": "COMPLETED"}]
+    if agent_used:
+        static_trace.append({"event": "agent_started", "title": "启动 Agent 工具循环",
+                             "detail": f"模型自主调用工具取证，共 {len(agent_trace)} 次工具调用。", "status": "COMPLETED"})
+        static_trace.extend(agent_trace)
+    static_trace.append({"event": "llm_completed", "title": "大模型生成研究结论", "detail": "模型输出已按候选代码和结构化 Schema 校验。", "status": "COMPLETED"})
+    run = {"runId": run_id, "status": "COMPLETED", "mode": f"{MODE}_{'AGENT' if agent_used else 'LLM'}_RESEARCH",
            "originalQuery": request.query, "createdAt": datetime.now(UTC).isoformat(),
            "completedAt": datetime.now(UTC).isoformat(), "policyVersion": "research-policy-v1",
            "modelVersion": f"{research_llm.provider}:{research_llm.model}", "snapshotId": f"{MODE.lower()}-snapshot",
@@ -772,10 +797,7 @@ async def create_run(
                            "dataFreshness": {"nav": {"status": fund.nav_freshness, "asOf": fund.nav_date}, "metrics": {"status": "MISSING", "asOf": fund.nav_date}},
                            "sourceSummary": {"primarySourceType": fund.nav_source_type, "officialDisclosureChecked": False, "lowestTrustLevel": fund.nav_trust_level},
                            "recommendationScore": assessment.score} for index, (fund, assessment) in enumerate(ranked_funds)],
-           "trace": [{"event": "plan_created", "title": "理解研究目标", "detail": model_output.intent, "status": "COMPLETED"},
-                     {"event": "knowledge_retrieved", "title": "检索研究知识库", "detail": f"检索到 {len(knowledge)} 个可引用片段。", "status": "COMPLETED"},
-                     {"event": "tool_completed", "title": "检索真实候选", "detail": f"从 {MODE} AKShare 数据快照取得 {len(items)} 只符合硬约束的候选。{unverified_note(items, request.filters)}", "status": "COMPLETED"},
-                     {"event": "llm_completed", "title": "大模型生成研究结论", "detail": "模型输出已按候选代码和结构化 Schema 校验。", "status": "COMPLETED"}],
+           "trace": static_trace,
            "disclaimer": "内容仅供基金研究参考，不构成投资建议。模型不生成交易指令。", "nextQuestions": model_output.followUpQuestions}
     run["conversationId"] = conversation_id
     repository.runs[run_id] = run

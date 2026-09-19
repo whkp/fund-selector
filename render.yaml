@@ -2,6 +2,9 @@ services:
   - type: web
     name: fund-compass-api
     runtime: python
+    # vendored 的 tau_agent / tau_ai（agent 工具循环）需要 Python ≥3.12（PEP 695）。
+    - key: PYTHON_VERSION
+      value: "3.13.14"
     # 用 lock 而不是 requirements.txt：后者是区间约束，重装结果不可复现。
     # lock 的生成方式、平台假设与局限见 backend/requirements.lock 头部注释。
     buildCommand: pip install -r backend/requirements.lock

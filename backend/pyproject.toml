@@ -27,7 +27,15 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
+
+[tool.ruff.lint.per-file-ignores]
+# vendored 自 huggingface/tau 的代码保持上游原样，不参与本仓库的 lint 裁量
+# （上游 MIT，见 tau_agent/LICENSE / tau_ai/LICENSE）。
+"tau_agent/*" = ["ALL"]
+"tau_ai/*" = ["ALL"]
+# 测试里断言失败就该让异常冒出来，这是 pytest 的正常用法。
+"tests/*" = ["BLE001", "SIM105"]
 
 [tool.ruff.lint]
 # 规则集显式写出来，不吃 ruff 的版本默认值 —— 默认值会随版本变化，
@@ -47,7 +55,3 @@ ignore = [
     # 行宽交给编辑器和审阅，不用来卡 CI。
     "E501",
 ]
-
-[tool.ruff.lint.per-file-ignores]
-# 测试里断言失败就该让异常冒出来，这是 pytest 的正常用法。
-"tests/*" = ["BLE001", "SIM105"]
