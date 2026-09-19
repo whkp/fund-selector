@@ -254,6 +254,9 @@ class ScreenRequest(BaseModel):
     llm: LLMRequestConfig | None = None
     # 留空则自动新建一个对话，供「复盘日志」串起多轮研究。
     conversationId: str = Field(default="", max_length=64)
+    # 前端生成的本次研究 ID：服务端收到后立即建立 RUNNING 占位记录，
+    # agent 每完成一步工具调用就把 trace 写进去，前端轮询拿到实时思考过程。
+    runId: str = Field(default="", max_length=64)
 
 
 class WatchRequest(BaseModel):
@@ -742,6 +745,24 @@ async def create_run(
     llm_succeeded = False
     agent_used = False
     agent_trace: list[dict[str, str]] = []
+    # RUNNING 占位：请求带 runId 时先落一条内存记录（注意：这不是数据库落库，
+    # 只服务于研究页的实时过程展示；研究失败时它会被标记为 FAILED）。
+    requested_run_id = request.runId.strip()
+    placeholder: dict[str, Any] | None = None
+    if requested_run_id:
+        placeholder = {
+            "runId": requested_run_id, "status": "RUNNING", "mode": f"{MODE}_RESEARCH",
+            "originalQuery": request.query, "createdAt": datetime.now(UTC).isoformat(),
+            "policyVersion": "research-policy-v1", "modelVersion": f"{llm_service.provider}:{llm_service.model}",
+            "snapshotId": f"{MODE.lower()}-snapshot",
+            "trace": [
+                {"event": "plan_created", "title": "理解研究目标", "detail": request.query[:200], "status": "COMPLETED"},
+                {"event": "knowledge_retrieved", "title": "检索研究知识库", "detail": f"检索到 {len(knowledge)} 个可引用片段。", "status": "COMPLETED"},
+                {"event": "tool_completed", "title": "圈定候选池", "detail": f"从 {MODE} AKShare 数据快照筛得 {len(items)} 只符合硬约束的候选。{unverified_note(items, request.filters)}", "status": "COMPLETED"},
+                {"event": "agent_started", "title": "启动 Agent 工具循环", "detail": "模型开始自主调用工具取证。", "status": "RUNNING"},
+            ],
+        }
+        repository.runs[requested_run_id] = placeholder
     try:
         if request.llm is not None or not agent_research.enabled:
             # 会话级自定义端点不保证支持 function calling，一律走旧单轮链路。
@@ -751,8 +772,21 @@ async def create_run(
         else:
             # Agent 模式：模型自主调工具取真实数据。失败时降级到旧链路重跑，
             # 而不是直接报错 —— agent 可能已消耗数轮模型调用，降级是最后一搏。
+            def _push_trace(step: dict[str, str]) -> None:
+                if placeholder is not None:
+                    # 工具开始事件到达时，把上一条还在 RUNNING 的标记为已完成，
+                    # 避免前端看到两条同时"进行中"的步骤。
+                    for existing in placeholder["trace"]:
+                        if existing.get("status") == "RUNNING":
+                            existing["status"] = "COMPLETED"
+                    placeholder["trace"].append(step)
+
             try:
-                model_output, agent_trace = await agent_research.run_research(request.query, history, request.limit)
+                model_output, agent_trace = await agent_research.run_research(
+                    request.query, history, request.limit,
+                    pool=[LLMService._compact_fund(fund) for fund in items],
+                    on_trace=_push_trace,
+                )
                 research_llm = agent_research
                 agent_used = True
             except LLMError:
@@ -771,6 +805,13 @@ async def create_run(
         if not llm_succeeded:
             for key, rule in reserved:
                 ratelimit_module.limiter.refund(key, rule)
+            if placeholder is not None:
+                placeholder["status"] = "FAILED"
+                placeholder["trace"].append({
+                    "event": "llm_failed", "title": "研究未能完成",
+                    "detail": "模型调用失败，已停止本次研究。可稍后重试。",
+                    "status": "FAILED",
+                })
     # 模型确实产出了结论，此时才建对话并写入这一轮问答。
     conversation_id = requested_conversation or (await auth_module.create_conversation(user.id, request.query))["id"]
     await auth_module.append_message(
@@ -782,11 +823,16 @@ async def create_run(
     for assessment in model_output.ranking:
         original = by_code.get(assessment.fundCode)
         if not original:
+            # Agent 模式下 ranking 可以引用工具检索到的池外基金（valid_codes 已
+            # 校验代码来自工具真实返回），这里从全量数据回源补齐，否则"美股"
+            # 这类预筛池覆盖不了的问题会算出 0 个候选。
+            original = repository.get_fund(assessment.fundCode)
+        if not original:
             continue
         ranked_funds.append((Fund(**{**original.__dict__, "score": assessment.score,
                                      "reason": assessment.reason, "highlights": [assessment.fit],
                                      "caveat": "；".join(assessment.riskFlags) or original.caveat}), assessment))
-    run_id = f"run_{uuid.uuid4().hex[:12]}"
+    run_id = requested_run_id or f"run_{uuid.uuid4().hex[:12]}"
     static_trace = [{"event": "plan_created", "title": "理解研究目标", "detail": model_output.intent, "status": "COMPLETED"},
                     {"event": "knowledge_retrieved", "title": "检索研究知识库", "detail": f"检索到 {len(knowledge)} 个可引用片段。", "status": "COMPLETED"},
                     {"event": "tool_completed", "title": "检索真实候选", "detail": f"从 {MODE} AKShare 数据快照取得 {len(items)} 只符合硬约束的候选。{unverified_note(items, request.filters)}", "status": "COMPLETED"}]

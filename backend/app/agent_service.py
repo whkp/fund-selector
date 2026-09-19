@@ -22,7 +22,7 @@ import re
 from collections.abc import AsyncIterator
 from typing import Any
 
-from tau_agent import AgentHarness, AgentHarnessConfig, MessageEndEvent, ToolExecutionEndEvent
+from tau_agent import AgentHarness, AgentHarnessConfig, MessageEndEvent, ToolExecutionEndEvent, ToolExecutionStartEvent
 from tau_agent.messages import AssistantMessage, TextContent, UserMessage
 from tau_ai import OpenAICompatibleConfig, OpenAICompatibleProvider
 
@@ -151,13 +151,52 @@ class AgentResearchService:
         cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
         return ModelResearchOutput.model_validate_json(cleaned)
 
+    @staticmethod
+    def _format_pool(pool: list[dict[str, Any]] | None) -> str:
+        """把预筛候选池压成紧凑文本，随首条消息一起交给模型。"""
+        if not pool:
+            return ""
+        lines: list[str] = []
+        for index, item in enumerate(pool[:60], start=1):
+            fee = item.get("fee")
+            one_year = item.get("oneYear")
+            ytd = item.get("ytd")
+            lines.append(
+                f"{index}. {item.get('fundCode')} {item.get('name')} | {item.get('type')}"
+                f" | 费率 {fee if fee is not None else '未获取'}%"
+                f" | 近1年 {one_year if one_year is not None else '未获取'}%"
+                f" | 今年来 {ytd if ytd is not None else '未获取'}%"
+            )
+        return (
+            "\n\n【已通过硬约束的候选池】共 "
+            f"{len(pool)} 只（按与问题的相关性排序；未列出的字段一律视为未获取，不要编造）：\n"
+            + "\n".join(lines)
+            + "\n你可以直接从中筛选对比，也可以用 search_funds / screen_funds 在全市场检索"
+            "更契合的基金（预筛池只是按问题相关性圈出的子集，不是全部可选范围）。"
+            "无论用哪种来源，最终 ranking 只能引用工具结果里出现过的代码。"
+        )
+
+    @classmethod
+    def _try_parse(cls, text: str) -> ModelResearchOutput | None:
+        try:
+            return cls._extract_json(text)
+        except Exception:  # noqa: BLE001 - 解析失败走重试/降级，不携带细节
+            return None
+
     async def run_research(
         self,
         query: str,
         history: list[dict[str, str]] | None = None,
         limit: int = 10,
+        pool: list[dict[str, Any]] | None = None,
+        on_trace: Any = None,
     ) -> tuple[ModelResearchOutput, list[dict[str, str]]]:
-        """跑完整 agent 循环，返回 (结构化研究结果, 工具调用轨迹)。"""
+        """跑完整 agent 循环，返回 (结构化研究结果, 工具调用轨迹)。
+
+        pool: 预筛候选池（main.py 的 research_pool 产物，compact dict 列表），
+        注入首条消息让模型不用盲目检索就知道池子里有什么。
+        on_trace: 每产生一条轨迹步骤就回调一次（用于研究页实时展示思考过程）。
+        """
         if not self.enabled:
             raise LLMError("Agent 模式未启用")
         provider, tools, state = self._build()
@@ -178,12 +217,28 @@ class AgentResearchService:
         trace: list[dict[str, str]] = []
         final_text = ""
 
+        def _emit(step: dict[str, str]) -> None:
+            trace.append(step)
+            if on_trace is not None:
+                try:
+                    on_trace(step)
+                except Exception:  # noqa: BLE001 - 展示层故障不能打断研究本身
+                    pass
+
         final_stop_reason = "stop"
 
         async def _consume(events: AsyncIterator[Any]) -> None:
             nonlocal final_text, final_stop_reason
             async for event in events:
-                if isinstance(event, ToolExecutionEndEvent):
+                if isinstance(event, ToolExecutionStartEvent):
+                    # 开始事件让前端立刻显示"正在调用工具 X"，而不是等执行完才冒出来。
+                    _emit({
+                        "event": "tool_started",
+                        "title": f"正在调用工具 {event.tool_name}",
+                        "detail": "读取真实数据中…",
+                        "status": "RUNNING",
+                    })
+                elif isinstance(event, ToolExecutionEndEvent):
                     result_text = event.result.text if event.result is not None else ""
                     detail = f"工具 {event.tool_name} 执行{'成功' if not event.is_error else '失败'}"
                     if state.get("last_call_duplicate"):
@@ -195,7 +250,7 @@ class AgentResearchService:
                                 detail += f"，命中 {len(payload['matches'])} 只"
                         except (ValueError, TypeError):
                             pass
-                    trace.append({
+                    _emit({
                         "event": "tool_completed",
                         "title": f"调用工具 {event.tool_name}",
                         "detail": detail,
@@ -207,19 +262,24 @@ class AgentResearchService:
                             block.text for block in event.message.content if isinstance(block, TextContent)
                         )
                         final_stop_reason = event.message.stop_reason or "stop"
+                        # 中间轮的自然语言（非 JSON）就是模型的思考过程，透出给前端；
+                        # 最终轮的 JSON 不进轨迹。
+                        text = final_text.strip()
+                        if text and not text.startswith("{") and self._try_parse(text) is None:
+                            _emit({
+                                "event": "thinking",
+                                "title": "模型思考",
+                                "detail": text[:220] + ("…" if len(text) > 220 else ""),
+                                "status": "COMPLETED",
+                            })
 
-        await _consume(harness.prompt(query))
+        user_message = query + self._format_pool(pool)
+        await _consume(harness.prompt(user_message))
 
         if not final_text.strip():
             raise LLMResponseError("Agent 循环结束但没有产出最终回答")
 
-        def _try_parse(text: str) -> ModelResearchOutput | None:
-            try:
-                return self._extract_json(text)
-            except Exception:  # noqa: BLE001 - 解析失败走重试/降级，不携带细节
-                return None
-
-        output = _try_parse(final_text)
+        output = self._try_parse(final_text)
         if output is None and final_stop_reason == "length":
             # 输出被 token 上限截断：JSON 必然残缺，让模型"重说一遍"只会再截断一次，
             # 直接抛错走降级链路（旧链路有 response_format=json_object 兜底）。
@@ -236,7 +296,7 @@ class AgentResearchService:
             harness.append_message(UserMessage(content=repair_prompt))
             final_text = ""
             await _consume(harness.continue_())
-            output = _try_parse(final_text)
+            output = self._try_parse(final_text)
         if output is None:
             raise LLMResponseError(
                 f"Agent 最终输出不是符合约定的 JSON（含修复重试）：{final_text[:120]}"

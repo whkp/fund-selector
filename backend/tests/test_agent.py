@@ -12,10 +12,10 @@ os.environ["FUND_COMPASS_MODE"] = "REFERENCE"
 
 import app.main as main_module
 from app.agent_tools import build_fund_tools
-from app.llm import LLMResponseError, LLMService, ModelAssessment, ModelResearchOutput
+from app.llm import LLMError, LLMResponseError, LLMService, ModelAssessment, ModelResearchOutput
 from app.main import app, repository
 from app.models import Fund
-from tau_agent.messages import AssistantMessage, TextContent, ToolCall
+from tau_agent.messages import AssistantMessage, TextContent, ToolCall, UserMessage
 from tau_agent.provider_events import AssistantDoneEvent, AssistantStartEvent, ToolCallEndEvent
 from tau_ai.fake import FakeProvider
 from tests.test_api import reference_fund  # 复用同一套确定性 Fund 构造
@@ -363,7 +363,10 @@ def test_research_endpoint_runs_agent_mode(monkeypatch: pytest.MonkeyPatch):
     # FINAL_JSON 引用的 161725 必须真实存在于仓库（模拟 agent 用工具查到它）。
     repository.funds["161725"] = reference_fund("161725", 90)
 
-    async def fake_run(query, history=None, limit=10):
+    seen_kwargs: dict[str, object] = {}
+
+    async def fake_run(query, history=None, limit=10, **kwargs):
+        seen_kwargs.update(kwargs)
         output = ModelResearchOutput.model_validate_json(json.dumps(FINAL_JSON, ensure_ascii=False))
         return output, [{"event": "tool_completed", "title": "调用工具 search_funds", "detail": "命中 1 只", "status": "COMPLETED"}]
 
@@ -376,13 +379,95 @@ def test_research_endpoint_runs_agent_mode(monkeypatch: pytest.MonkeyPatch):
     assert body["candidates"][0]["fund"]["code"] == "161725"
     # agent 候选不在预筛池时也允许引用（repository 回源补齐）
     assert body["candidates"][0]["analysis"] == "白酒指数代表"
+    # 端点必须把预筛池交给 agent（否则模型检索不到主题时只能返回空排名）
+    pool = seen_kwargs.get("pool")
+    assert isinstance(pool, list) and pool, "research pool must be passed to agent"
+    assert any(item["fundCode"] == "161725" for item in pool)
+
+
+def test_research_endpoint_streams_trace_for_run_id(monkeypatch: pytest.MonkeyPatch):
+    """带 runId 的请求：先有 RUNNING 占位 + trace 可轮询，完成后 trace 一致。"""
+    service = main_module.agent_research
+    monkeypatch.setattr(service, "enabled", True)
+    repository.funds["161725"] = reference_fund("161725", 90)
+
+    pushed: list[dict[str, str]] = []
+
+    async def fake_run(query, history=None, limit=10, pool=None, on_trace=None):
+        step = {"event": "tool_completed", "title": "调用工具 search_funds", "detail": "命中 1 只", "status": "COMPLETED"}
+        if on_trace is not None:
+            on_trace(step)
+        pushed.append(step)
+        output = ModelResearchOutput.model_validate_json(json.dumps(FINAL_JSON, ensure_ascii=False))
+        return output, [step]
+
+    monkeypatch.setattr(service, "run_research", fake_run)
+    run_id = f"run_{uuid.uuid4().hex[:12]}"
+    headers = register_user()
+    response = client.post("/api/recommendations/runs", json={"query": "白酒", "limit": 5, "runId": run_id}, headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["runId"] == run_id
+    # 完成后 trace 包含轮询期间推送的步骤
+    trace_after = client.get(f"/api/recommendations/runs/{run_id}/trace", headers=headers)
+    assert trace_after.status_code == 200
+    titles = [entry["title"] for entry in trace_after.json()["trace"]]
+    assert "调用工具 search_funds" in titles
+    assert len(pushed) == 1
+
+
+def test_research_endpoint_marks_placeholder_failed(monkeypatch: pytest.MonkeyPatch):
+    """研究彻底失败时：占位记录标记 FAILED，trace 里留下失败步骤（可复盘过程）。"""
+    service = main_module.agent_research
+    monkeypatch.setattr(service, "enabled", True)
+
+    async def broken_run(query, history=None, limit=10, **kwargs):
+        raise LLMResponseError("最终输出不是 JSON")
+
+    async def broken_research(query, funds, knowledge, limit, history=None):
+        raise LLMError("模型不可用")
+
+    monkeypatch.setattr(service, "run_research", broken_run)
+    monkeypatch.setattr(main_module.llm_service, "research", broken_research)
+    run_id = f"run_{uuid.uuid4().hex[:12]}"
+    headers = register_user()
+    response = client.post("/api/recommendations/runs", json={"query": "白酒", "limit": 5, "runId": run_id}, headers=headers)
+    assert response.status_code == 502, response.text
+    failed = client.get(f"/api/recommendations/runs/{run_id}/trace", headers=headers)
+    assert failed.status_code == 200
+    body = failed.json()["trace"]
+    assert any(entry.get("status") == "FAILED" for entry in body)
+
+
+def test_agent_receives_pool_and_emits_trace():
+    """run_research 注入候选池文本到首条消息，on_trace 逐步回调。"""
+    repo = StubRepository({"161725": reference_fund("161725", 90)})
+    repo.funds["161725"].theme = "白酒"
+    service = make_service(repo, [
+        tool_call_stream(ToolCall(id="call_p", name="search_funds", arguments={"query": "白酒"})),
+        final_stream(),
+    ])
+    import asyncio
+
+    pool = [LLMService._compact_fund(repo.funds["161725"])]
+    steps: list[dict[str, str]] = []
+    output, _trace = asyncio.run(service.run_research(
+        "白酒主题基金", None, 10, pool=pool, on_trace=steps.append,
+    ))
+    assert output.ranking[0].fundCode == "161725"
+    assert any(entry["event"] == "tool_started" for entry in steps)
+    assert any(entry["title"] == "调用工具 search_funds" for entry in steps)
+    # 首条 user 消息里必须带有候选池上下文（FakeProvider.calls 记录了每轮消息列表）
+    provider = service._provider
+    first_user = next(m for m in provider.calls[0][2] if isinstance(m, UserMessage))
+    assert "已通过硬约束的候选池" in first_user.content
+    assert "161725" in first_user.content
 
 
 def test_research_endpoint_falls_back_when_agent_fails(monkeypatch: pytest.MonkeyPatch):
     service = main_module.agent_research
     monkeypatch.setattr(service, "enabled", True)
 
-    async def broken_run(query, history=None, limit=10):
+    async def broken_run(query, history=None, limit=10, **kwargs):
         raise LLMResponseError("最终输出不是 JSON")
 
     async def fake_research(query, funds, knowledge, limit, history=None):
@@ -399,3 +484,5 @@ def test_research_endpoint_falls_back_when_agent_fails(monkeypatch: pytest.Monke
     body = response.json()
     assert body["mode"].endswith("_LLM_RESEARCH")
     assert body["summary"] == "降级链路结论"
+
+

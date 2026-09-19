@@ -15,6 +15,15 @@ export type ResearchRun = {
   disclaimer: string
 }
 
+/** 研究进行中的实时轨迹（服务端在 agent 每完成一步后更新）。 */
+export type RunTrace = {
+  runId: string
+  trace: Array<{ event: string; title: string; detail: string; status: string }>
+  policyVersion: string
+  modelVersion: string
+  snapshotId: string
+}
+
 export type AIStatus = {
   provider: string
   model: string
@@ -113,6 +122,8 @@ export async function createResearchRun(query: string, maxFee: number, riskLevel
   llm?: SessionLLMConfig
   /** 传入已存在的对话 ID 即为「追问」，留空则由服务端新建一个对话。 */
   conversationId?: string
+  /** 前端生成的本次研究 ID：服务端收到后立即建 RUNNING 占位，供轮询实时思考过程。 */
+  runId?: string
 }): Promise<ResearchRun> {
   return request<ResearchRun>('/recommendations/runs', {
     method: 'POST',
@@ -120,6 +131,7 @@ export async function createResearchRun(query: string, maxFee: number, riskLevel
       query,
       limit: 10,
       conversationId: options?.conversationId ?? '',
+      runId: options?.runId ?? '',
       filters: {
         riskLevelMax,
         maxFee,
@@ -130,6 +142,16 @@ export async function createResearchRun(query: string, maxFee: number, riskLevel
       ...(options?.llm ? { llm: options.llm } : {}),
     }),
   }, { timeoutMs: TIMEOUT_MS.research })
+}
+
+/**
+ * 轮询研究过程轨迹。研究刚开始时占位记录可能还没建好（404），
+ * 调用方按「未就绪」处理即可，不算错误。
+ */
+export async function fetchRunTrace(runId: string): Promise<RunTrace> {
+  return request<RunTrace>(`/recommendations/runs/${encodeURIComponent(runId)}/trace`, undefined, {
+    timeoutMs: TIMEOUT_MS.default,
+  })
 }
 
 export async function fetchWatchlist(): Promise<Fund[]> {

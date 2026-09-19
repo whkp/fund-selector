@@ -3,14 +3,14 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   Activity, ArrowDownUp, ArrowUpRight, BarChart3, BellRing, Bot, CalendarClock,
   Check, ChevronDown, ChevronRight, CircleAlert, Clock3, Compass, Database,
-  FileSearch, Filter, Info, Landmark, LineChart, ListFilter, LogOut, Menu, MoreHorizontal,
+  FileSearch, Filter, Info, Landmark, LineChart, ListFilter, Loader2, LogOut, Menu, MoreHorizontal,
   Plus, Radio, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Star, X
 } from 'lucide-vue-next'
 import type { Fund } from './types'
 import {
-  addWatchlistItem, createResearchRun, fetchAIStatus, fetchFunds, fetchFundHistory, fetchMarketQuotes, fetchWatchlist,
-  refreshMarketQuotes, removeWatchlistItem, type MarketQuote, type MarketQuoteResponse,
-  type AIStatus, type FundHistoryResponse, type MarketSourceStatus, type ResearchRun, type SessionLLMConfig
+  addWatchlistItem, createResearchRun, fetchAIStatus, fetchFunds, fetchFundHistory, fetchMarketQuotes, fetchRunTrace,
+  fetchWatchlist, refreshMarketQuotes, removeWatchlistItem, type MarketQuote, type MarketQuoteResponse,
+  type AIStatus, type FundHistoryResponse, type MarketSourceStatus, type ResearchRun, type RunTrace, type SessionLLMConfig
 } from './services/fund-api'
 import LoginView from './views/LoginView.vue'
 import {
@@ -44,6 +44,9 @@ const apiConnected = ref(false)
 const loadError = ref('')
 const isResearchRunning = ref(false)
 const latestRun = ref<ResearchRun | null>(null)
+// 研究进行中的实时思考过程：轮询 /runs/{id}/trace 拿到 agent 的每一步。
+const liveTrace = ref<RunTrace['trace']>([])
+let traceTimer: number | undefined
 const aiStatus = ref<AIStatus | null>(null)
 const aiSettingsOpen = ref(false)
 const sessionLLM = ref<SessionLLMConfig>({
@@ -106,8 +109,32 @@ const fundTypeOptions = computed(() => {
   return [{ label: '不限', count: availableFunds.value.length }, ...options]
 })
 
+/**
+ * 主题筛选：AKShare 排行没有主题字段（theme 全是「未标注」占位），
+ * 这里按基金名称里的主题词做包含匹配，词表按公开基金命名惯例整理。
+ * 「均衡配置 / 不限主题」不参与过滤。
+ */
+const THEME_KEYWORDS: Record<string, string[]> = {
+  '新能源 / 制造': ['新能源', '光伏', '锂电', '电池', '能源', '环保', '电力', '车', '制造', '工业', '材料', '碳中和', '装备'],
+  '科技成长': ['科技', '半导体', '芯片', '电子', '信息', '计算机', '互联网', '人工智能', '智能', '软件', '通信', '传媒', '游戏', '数字', '5G', '算力', '机器人', '创新', '科创'],
+}
+
+function matchesTheme(fund: Fund, wanted: string): boolean {
+  const keywords = THEME_KEYWORDS[wanted]
+  if (!keywords) return true
+  const haystack = `${fund.name} ${fund.type}`
+  return keywords.some((keyword) => haystack.includes(keyword))
+}
+
 const emptyHint = computed(() => {
-  if (latestRun.value) return '模型未从当前真实候选范围中返回结果，请调整目标或补充条件。'
+  if (latestRun.value && !displayedFunds.value.length) {
+    const themeActive = Boolean(THEME_KEYWORDS[theme.value])
+    const themeHits = themeActive && availableFunds.value.some((fund) => matchesTheme(fund, theme.value))
+    if (themeActive && !themeHits) {
+      return `当前研究候选里没有「${theme.value}」主题的基金。可在左侧切回不限主题，或换一个研究目标重新研究。`
+    }
+    return '模型未从当前真实候选范围中返回结果，请调整目标或补充条件。'
+  }
   if (loadError.value) return loadError.value
   if (fundType.value !== '不限' && fundUniverse.value.length) {
     const inUniverse = fundUniverse.value.some((fund) => matchesFundType(fund.type, fundType.value))
@@ -122,10 +149,14 @@ const displayedFunds = computed(() => {
   const riskRank: Record<string, number> = { '低风险': 1, '中低风险': 2, '中风险': 3, '中高风险': 4, '高风险': 5 }
   return availableFunds.value
     .filter((fund) => matchesFundType(fund.type, fundType.value))
+    .filter((fund) => matchesTheme(fund, theme.value))
     .filter((fund) => !isKnown(fund.risk) || riskRank[fund.risk] <= riskRank[riskLimit.value])
     .filter((fund) => fund.fee === null || fund.fee <= maxFee.value)
     .slice(0, 30)
 })
+
+/** 数据源给不出风险等级时（候选全部"未获取"），风险上限条件实际不参与筛选，界面要如实说明。 */
+const riskFilterUsable = computed(() => displayedFunds.value.some((fund) => isKnown(fund.risk)))
 
 const primaryFund = computed(() => displayedFunds.value[0] ?? availableFunds.value[0] ?? null)
 const activeTrace = computed(() => latestRun.value?.trace ?? [])
@@ -267,6 +298,26 @@ function resetResearch() {
   notify('已恢复为本次研究条件')
 }
 
+function stopTracePolling() {
+  if (traceTimer !== undefined) {
+    window.clearInterval(traceTimer)
+    traceTimer = undefined
+  }
+}
+
+/** 研究进行中轮询服务端轨迹，让用户看到 agent 每一步在做什么。 */
+function startTracePolling(runId: string) {
+  stopTracePolling()
+  liveTrace.value = []
+  traceTimer = window.setInterval(() => {
+    fetchRunTrace(runId).then((payload) => {
+      liveTrace.value = payload.trace
+    }).catch(() => {
+      /* 占位记录尚未建好（404）或瞬时网络抖动：静默，下一轮再取 */
+    })
+  }, 1200)
+}
+
 async function runResearch() {
   if (isResearchRunning.value) return
   if (!apiConnected.value) {
@@ -274,6 +325,9 @@ async function runResearch() {
     return
   }
   isResearchRunning.value = true
+  // runId 由前端生成：服务端收到后立即建 RUNNING 占位并随 agent 推进更新 trace。
+  const runId = `run_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`
+  startTracePolling(runId)
   try {
     const run = await createResearchRun(query.value, maxFee.value, riskLimit.value, {
       fundTypes: fundType.value === '不限' ? [] : [fundType.value],
@@ -282,15 +336,20 @@ async function runResearch() {
       llm: hasSessionLLM.value ? sessionLLM.value : undefined,
       // 已有对话即为追问，会接着上一轮存进同一条记录。
       conversationId: activeConversationId.value,
+      runId,
     })
     latestRun.value = run
     activeConversationId.value = run.conversationId ?? ''
     availableFunds.value = run.candidates.map((candidate) => candidate.fund)
     await loadConversations()
-    notify(`研究完成：通过硬约束的候选 ${run.candidates.length} 只`)
+    notify(run.candidates.length
+      ? `研究完成：通过硬约束的候选 ${run.candidates.length} 只`
+      : '研究完成：未找到契合的候选，结论见上方摘要')
   } catch (error) {
     notify(error instanceof Error ? error.message : '研究请求失败')
   } finally {
+    stopTracePolling()
+    liveTrace.value = []
     isResearchRunning.value = false
   }
 }
@@ -433,6 +492,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (marketTimer !== undefined) window.clearInterval(marketTimer)
+  stopTracePolling()
 })
 </script>
 
@@ -508,6 +568,28 @@ onBeforeUnmount(() => {
             <p class="ambiguity"><CircleAlert :size="14" />“波动不要太大”“费用尽量低”仍为偏好项，未被替换成未经确认的数值阈值。</p>
           </section>
 
+          <section v-if="isResearchRunning" class="research-progress" aria-label="研究过程">
+            <div class="progress-head">
+              <span class="progress-pulse"></span>
+              <b>研究进行中</b>
+              <span class="progress-hint">Agent 正在调用真实数据工具取证，通常需要 30~90 秒</span>
+            </div>
+            <ol class="progress-steps">
+              <li v-for="(step, index) in liveTrace" :key="index" class="progress-step" :class="step.status.toLowerCase()">
+                <span class="step-marker">
+                  <Loader2 v-if="step.status === 'RUNNING'" :size="15" class="step-spin" />
+                  <Check v-else-if="step.status !== 'FAILED'" :size="14" />
+                  <CircleAlert v-else :size="14" />
+                </span>
+                <span class="step-body"><b>{{ step.title }}</b><small>{{ step.detail }}</small></span>
+              </li>
+              <li v-if="!liveTrace.length" class="progress-step running">
+                <span class="step-marker"><Loader2 :size="15" class="step-spin" /></span>
+                <span class="step-body"><b>正在建立候选池…</b><small>正在与数据源同步</small></span>
+              </li>
+            </ol>
+          </section>
+
           <section v-if="latestRun" class="ai-summary" aria-label="大模型研究结论">
             <div><Sparkles :size="17" /><span>大模型研究结论 · {{ latestRun.modelVersion }}</span></div>
             <p>{{ latestRun.summary }}</p>
@@ -523,6 +605,7 @@ onBeforeUnmount(() => {
               </div>
               <label class="filter-label">最高风险等级</label>
               <div class="select-wrap"><select v-model="riskLimit"><option>中风险</option><option>中高风险</option><option>高风险</option></select><ChevronDown :size="16" /></div>
+              <p v-if="!riskFilterUsable" class="filter-inactive">该条件当前未参与筛选：AKShare 公开排行不提供风险等级，全部候选按“未获取”放行。</p>
               <label class="filter-label">关注主题</label>
               <div class="select-wrap"><select v-model="theme"><option>新能源 / 制造</option><option>科技成长</option><option>均衡配置</option><option>不限主题</option></select><ChevronDown :size="16" /></div>
               <label class="filter-label slider-label">管理费上限 <strong>{{ maxFee.toFixed(2) }}%</strong></label>
