@@ -1,5 +1,5 @@
 import type { Fund } from '../types'
-import { request } from './http'
+import { request, TIMEOUT_MS } from './http'
 
 export type ResearchRun = {
   runId: string
@@ -74,7 +74,10 @@ type FundListResponse = { items: Fund[] }
 type WatchlistResponse = { items: Array<{ fund: Fund }> }
 
 export async function fetchFunds(): Promise<Fund[]> {
-  const payload = await request<FundListResponse>('/funds')
+  // 首次请求会触发服务端抓一遍 AKShare 全量基金列表，比普通读接口慢得多。
+  const payload = await request<FundListResponse>('/funds', undefined, {
+    timeoutMs: TIMEOUT_MS.upstream,
+  })
   return payload.items
 }
 
@@ -92,7 +95,11 @@ export type FundHistoryResponse = {
 }
 
 export async function fetchFundHistory(code: string, period = '1年'): Promise<FundHistoryResponse> {
-  return request<FundHistoryResponse>(`/funds/${code}/history?period=${encodeURIComponent(period)}`)
+  return request<FundHistoryResponse>(
+    `/funds/${code}/history?period=${encodeURIComponent(period)}`,
+    undefined,
+    { timeoutMs: TIMEOUT_MS.upstream },
+  )
 }
 
 export async function fetchAIStatus(): Promise<AIStatus> {
@@ -122,7 +129,7 @@ export async function createResearchRun(query: string, maxFee: number, riskLevel
       },
       ...(options?.llm ? { llm: options.llm } : {}),
     }),
-  })
+  }, { timeoutMs: TIMEOUT_MS.research })
 }
 
 export async function fetchWatchlist(): Promise<Fund[]> {
@@ -131,11 +138,15 @@ export async function fetchWatchlist(): Promise<Fund[]> {
 }
 
 export async function fetchMarketQuotes(): Promise<MarketQuoteResponse> {
-  return request<MarketQuoteResponse>('/market/etf-quotes')
+  return request<MarketQuoteResponse>('/market/etf-quotes', undefined, {
+    timeoutMs: TIMEOUT_MS.upstream,
+  })
 }
 
 export async function refreshMarketQuotes(): Promise<MarketQuoteResponse> {
-  return request<MarketQuoteResponse>('/market/etf-quotes/refresh', { method: 'POST' })
+  return request<MarketQuoteResponse>('/market/etf-quotes/refresh', { method: 'POST' }, {
+    timeoutMs: TIMEOUT_MS.upstream,
+  })
 }
 
 export async function addWatchlistItem(fund: Fund): Promise<void> {

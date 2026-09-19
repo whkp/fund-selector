@@ -419,7 +419,11 @@ onMounted(async () => {
   // 先确认登录态，避免未登录时发出一堆注定 401 的请求。
   try {
     currentUser.value = await fetchMe()
-  } catch {
+  } catch (error) {
+    // 这里静默是刻意的：fetchMe 已把 401 翻译成 null（未登录属正常情况），
+    // 能走到 catch 的是网络或服务端故障。此时退回登录页就是最合理的降级，
+    // 再弹一条错误提示只会让「未登录」和「连不上」两种情况长得一模一样。
+    console.warn('[auth] 会话恢复失败，按未登录处理', error)
     currentUser.value = null
   }
   authReady.value = true

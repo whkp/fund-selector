@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "api": "cd backend && ../.venv/bin/python run.py",
-    "worker": "cd backend && ../.venv/bin/python -m app.workers.scheduler",
+    "api": "cd backend && python run.py",
+    "worker": "cd backend && python -m app.workers.scheduler",
     "build": "vue-tsc -b && vite build",
     "typecheck": "vue-tsc --noEmit"
   },
