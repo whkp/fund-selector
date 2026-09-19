@@ -67,12 +67,18 @@ class AgentResearchService:
             self._provider = OpenAICompatibleProvider(config)
             # 延迟 import 避免与 llm.py 的模块级依赖成环：agent_tools 只依赖 tau_*。
             from .agent_tools import build_fund_tools
+            from .enrichment import ENRICH_BUDGET_PER_RUN, enrich_fund
+
+            async def _enrich(code: str) -> Any:
+                return await enrich_fund(self.repository, code)
 
             self._tools, self._tool_state = build_fund_tools(
                 repository=self.repository,
                 knowledge_base=self.knowledge_base,
                 compact_fund=LLMService._compact_fund,
+                enricher=_enrich,
             )
+            self._enrich_budget = ENRICH_BUDGET_PER_RUN
         return self._provider, self._tools or [], self._tool_state or {}
 
     def _system_prompt(self) -> str:
@@ -88,6 +94,9 @@ class AgentResearchService:
             "- 多角度验证：主题契合用 search_funds，横向对比用 screen_funds，"
             "引用回撤/规模等细节前用 get_fund_detail 确认。"
             "字段在工具结果里是 null 时，如实说明「未获取」。\n"
+            "- get_fund_detail 会对缺失主数据自动补数（经理/公司/规模/官方回撤，"
+            "命中时结果带 enrichedNow 标记，回撤为雪球官方口径而非自算）；"
+            "每轮补数额度有限，优先用在最终候选上。\n"
             "- 一般 2~4 次工具调用足够，不要为了刷次数重复调用同样的参数。\n"
             "\n"
             "## 分析方法\n"
@@ -155,6 +164,7 @@ class AgentResearchService:
         state["seen_codes"] = set()
         state["call_cache"] = {}  # 每轮研究独立去重缓存（agent_tools 的 dedup 层读写）
         state["duplicate_calls"] = 0
+        state["enrich_budget"] = getattr(self, "_enrich_budget", 0)  # 每轮研究的补数额度
         harness = AgentHarness(
             AgentHarnessConfig(
                 provider=provider,

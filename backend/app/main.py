@@ -62,6 +62,17 @@ async def _warm_up() -> None:
         # 预热失败不能挡住启动：第一次请求会再试一次。
         # 但不能静默 —— 冷启动时数据源出问题，这条记录是唯一的线索。
         logger.warning("基金目录预热失败：%s", exc)
+        return
+    # 排行接口缺的经理/规模/回撤等字段，之前按需补过并落在 Neon 里；
+    # 启动时回填进内存，agent 查这些基金就不用重新打逐只接口。
+    try:
+        from .enrichment import load_enriched
+
+        restored = await load_enriched(repository)
+        if restored:
+            logger.info("已从快照回填 %s 只基金的补数主数据", restored)
+    except Exception as exc:  # noqa: BLE001 - 回填失败等同没有缓存，按需补数会再补
+        logger.warning("补数快照回填失败：%s", exc)
 
 
 @asynccontextmanager

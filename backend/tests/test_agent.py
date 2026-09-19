@@ -1,6 +1,7 @@
 import json
 import os
 import uuid
+from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -167,7 +168,6 @@ def test_fund_code_guard_rejects_malformed_codes():
 def test_screen_tool_supports_within_theme_ranking():
     """池内二次排序：query 先圈主题池，再在池内应用条件与排序（对应 --within-* 语义）。"""
     import asyncio
-    from dataclasses import replace
 
     liquor_a = replace(reference_fund("161725", 90), theme="白酒", name="招商中证白酒A")
     liquor_b = replace(reference_fund("012414", 70), theme="白酒", name="招商中证白酒C")
@@ -235,6 +235,52 @@ def test_screen_tool_zero_coverage_guard():
     # 有覆盖的条件不受影响
     ok = asyncio.run(tool.execute("c7", {"minOneYear": 11}))
     assert json.loads(ok.text)["totalPassed"] == 1
+
+
+def test_enrichment_parsers():
+    """补数模块的解析函数：规模/主题/官方回撤。"""
+    from app.enrichment import _official_drawdown, clean_theme, parse_scale
+
+    assert parse_scale("197.40亿") == 197.4
+    assert round(parse_scale("5236.81万"), 4) == 0.5237
+    assert parse_scale("暂无规模") is None
+    assert clean_theme("中证白酒指数收益率×95%＋金融机构人民币活期存款基准利率（税后）×5%") == "中证白酒指数"
+    assert clean_theme("沪深300指数*95%+活期*5%") == "沪深300指数"
+    assert clean_theme("") is None
+    rows = [{"业绩类型": "阶段业绩", "周期": "近1年", "本产品最大回撒": 38.67}]
+    assert _official_drawdown(rows) == -38.67
+    assert _official_drawdown([{"业绩类型": "年度业绩", "周期": "近1年", "本产品最大回撒": 1.0}]) is None
+
+
+def test_get_fund_detail_triggers_enrichment_with_budget():
+    """get_fund_detail 命中占位主数据时按需补数；预算耗尽后给提示而不是静默缺失。"""
+    import asyncio
+
+    repo = StubRepository({"008286": reference_fund("008286", 90), "004640": reference_fund("004640", 80)})
+    calls: list[str] = []
+
+    async def enricher(code: str):
+        calls.append(code)
+        repo.funds[code] = replace(
+            repo.funds[code], manager="侯昊", company="招商基金", scale=197.4, drawdown=-38.67,
+        )
+        return {"code": code, "updated": {"manager": "侯昊"}}
+
+    tools, state = build_fund_tools(
+        repository=repo, knowledge_base=StubKnowledge(),
+        compact_fund=LLMService._compact_fund, enricher=enricher,
+    )
+    state["enrich_budget"] = 1
+    tool = next(t for t in tools if t.name == "get_fund_detail")
+
+    first = json.loads(asyncio.run(tool.execute("c8", {"code": "008286"})).text)
+    assert first["enrichedNow"] is True and first["manager"] == "侯昊"
+    assert calls == ["008286"] and state["enrich_budget"] == 0
+
+    # 预算耗尽：另一只基金不再触发补数，返回原始字段 + 额度提示
+    second = json.loads(asyncio.run(tool.execute("c9", {"code": "004640"})).text)
+    assert calls == ["008286"] and "enrichedNow" not in second
+    assert "额度已用完" in second["note"]
 
 
 def test_agent_loop_happy_path():

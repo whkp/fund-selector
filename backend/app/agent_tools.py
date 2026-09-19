@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+from app.enrichment import needs_enrichment as _fund_needs_enrichment
 from tau_agent.messages import TextContent
 from tau_agent.tools import AgentTool, AgentToolResult
 from tau_agent.types import JSONValue
@@ -78,15 +79,17 @@ def build_fund_tools(
     repository: Any,
     knowledge_base: Any,
     compact_fund: CompactFundFn,
+    enricher: Callable[[str], Awaitable[Any]] | None = None,
 ) -> tuple[list[AgentTool], dict[str, Any]]:
     """构建基金研究领域工具。
 
     repository: DataRepository（含 n-gram 相关性索引）；
     knowledge_base: 研究知识库（含异步 search）；
-    compact_fund: Fund -> 紧凑证据字典（与 LLMService._compact_fund 同一实现）。
+    compact_fund: Fund -> 紧凑证据字典（与 LLMService._compact_fund 同一实现）；
+    enricher: 可选；get_fund_detail 命中占位主数据时按需补数（enrichment.enrich_fund）。
     返回 (工具列表, state)；state["seen_codes"] 在执行中累积真实出现过的基金代码。
     """
-    state: dict[str, Any] = {"seen_codes": set()}
+    state: dict[str, Any] = {"seen_codes": set(), "enrich_budget": 0}
 
     def _note(codes: list[str]) -> None:
         state["seen_codes"].update(codes)
@@ -137,7 +140,25 @@ def build_fund_tools(
         fund = repository.get_fund(code)
         if fund is None:
             return _error_result(f"未找到基金代码 {code}，请先用 search_funds 确认代码。")
-        return _json_result(_pack(fund))
+        enriched_now = False
+        enrichment_note = ""
+        if enricher is not None and state.get("enrich_budget", 0) > 0 and _fund_needs_enrichment(fund):
+            state["enrich_budget"] -= 1
+            try:
+                report = await enricher(code)
+                enriched_now = bool(report and report.get("updated"))
+                if enriched_now:
+                    fund = repository.get_fund(code) or fund
+            except Exception as exc:  # noqa: BLE001 - 补数失败不挡详情返回
+                enrichment_note = f"主数据补齐失败（{str(exc)[:80]}），以下为排行接口可得字段。"
+        payload = _pack(fund)
+        if enriched_now:
+            payload["enrichedNow"] = True
+        elif enricher is not None and state.get("enrich_budget", 0) <= 0 and _fund_needs_enrichment(fund):
+            enrichment_note = "本轮研究的补数额度已用完，部分主数据（经理/规模/回撤等）仍缺失。"
+        if enrichment_note:
+            payload["note"] = enrichment_note
+        return _json_result(payload)
 
     async def screen_funds(
         _tool_call_id: str,
