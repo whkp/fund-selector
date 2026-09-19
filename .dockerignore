@@ -8,8 +8,17 @@ venv
 **/*.pyc
 docs
 src
-data
-*.log
+# ⚠️ 必须写成 **/data，不能写 data。不含斜杠的模式只匹配「构建上下文根目录」，
+# 而根目录根本没有 data/ —— 写 data 等于这条规则完全没生效，
+# 于是 COPY backend/ 会把 backend/data/ 里的 .invite-code、.jwt-secret、
+# fund-compass.db（含用户密码哈希）一起打进镜像。容器启动时会自动重建这些文件。
+**/data
+# 日志同理：logs/ 在根目录，backend/logs/ 也可能出现，按任意层级排除。
+**/logs
+**/*.log
 .env
 .env.local
 .env.*.local
+# 真实配置含 LLM API Key，绝不能打进镜像（.gitignore 只管 git，不管 docker build）。
+# 容器里请用 FUND_COMPASS_LLM_* 环境变量覆盖。
+config/fund-compass.json

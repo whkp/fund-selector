@@ -34,6 +34,15 @@ find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null |
 rm -rf "$STAGE/backend/tests" "$STAGE/backend/migrations"
 rm -f "$STAGE/backend/alembic.ini" "$STAGE/backend/pyproject.toml"
 
+# 真实配置含 LLM API Key，Space 默认公开，绝不能推上去。
+# 线上改用 Space 的 Settings → Variables and secrets 配 FUND_COMPASS_LLM_*。
+rm -f "$STAGE/config/fund-compass.json"
+
+# backend/data/ 里是 .invite-code（注册准入凭证）、.jwt-secret 和 fund-compass.db
+# （含用户邮箱与密码哈希）。Space 默认公开，这几个文件一旦推上去等于把门敞开。
+# 进程启动时会自动重建它们（见 auth.py 的 _load_or_create_invite_codes / load_or_create_secret）。
+rm -rf "$STAGE/backend/data"
+
 # Hugging Face 只认根目录的 README.md 作为 Space 元信息载体
 cat > "$STAGE/README.md" <<'YAML'
 ---
