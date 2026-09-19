@@ -19,6 +19,11 @@ LOG = ROOT / "logs" / "tunnel.log"
 QR_PATH = ROOT / "logs" / "public-qr.png"
 PORT = 8080
 
+# Named tunnel: the hostname is bound once via
+# "cloudflared tunnel route dns fund-compass funds.kpcode.xyz" and never
+# changes, unlike the quick-tunnel random prefix.
+NAMED_URL = "https://funds.kpcode.xyz"
+
 # cloudflared prints the address once per tunnel; a restart appends a new one,
 # so the last match is the live one. Matching only on https:// skips the
 # "Requesting new quick Tunnel on trycloudflare.com..." banner lines.
@@ -26,11 +31,17 @@ URL_RE = re.compile(r"https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com")
 
 
 def read_url():
-    if not LOG.exists():
-        return None
-    text = LOG.read_text(encoding="utf-8", errors="replace")
-    found = URL_RE.findall(text)
-    return found[-1] if found else None
+    # Quick tunnel legacy: an old log line still yields the random URL.
+    if LOG.exists():
+        text = LOG.read_text(encoding="utf-8", errors="replace")
+        found = URL_RE.findall(text)
+        if found:
+            return found[-1]
+    # Named tunnel: fixed hostname. A successful start logs its registration;
+    # a missing log line still counts when the process itself is alive.
+    if cloudflared_running():
+        return NAMED_URL
+    return None
 
 
 def port_open(port):
