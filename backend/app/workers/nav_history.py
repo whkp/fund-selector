@@ -10,6 +10,12 @@ logger = logging.getLogger(__name__)
 
 
 async def sync_fund_history(fund: Fund, period: str = "1年") -> dict[str, object]:
+    """把单只基金的历史净值落成快照。
+
+    ⚠️ **当前没有调用点** —— 全仓库只有这一处定义。历史 NAV 的批量同步还没实现
+    （`docs/开发进展.md` 也这么写），这里是给生产化预留的骨架。将来接定时任务时
+    把它接上，或者删掉，别让它一直悬在这里让人误以为在跑。
+    """
     provider = AKShareProvider()
     records = await provider.history(fund.code, period)
     if not records:

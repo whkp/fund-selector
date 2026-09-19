@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .config import config_value
@@ -46,7 +45,7 @@ class AKShareProvider:
         if not self.enabled:
             self.status.status = "NOT_CONFIGURED"
             return []
-        self.status.last_attempt_at = datetime.now(timezone.utc)
+        self.status.last_attempt_at = datetime.now(UTC)
         try:
             import akshare as ak
 
@@ -54,34 +53,48 @@ class AKShareProvider:
             rankings = await asyncio.to_thread(ak.fund_open_fund_rank_em, symbol="全部")
             if rankings is None or rankings.empty:
                 raise RuntimeError("AKShare 基金排行返回空数据")
-            directory_by_code = {
-                str(row.get("基金代码", "")).zfill(6): row
-                for _, row in directory.iterrows()
-            } if directory is not None else {}
-            result = []
-            for index, row in rankings.head(500).iterrows():
-                code = str(row.get("基金代码", "")).zfill(6)
-                if not code or code == "000000":
-                    continue
-                directory_row = directory_by_code.get(code, {})
-                name = str(row.get("基金简称") or directory_row.get("基金简称") or code)
-                result.append(self._ranked_fund(code, name, row, directory_row, index))
+            # 抓取已经在 to_thread 里跑，但真正耗 CPU 的是解析：目录建索引 +
+            # 500 行逐行构造 Fund。这段是纯同步计算，留在主协程会在冷启动
+            # _warm_up() 和首个列表请求期间占住事件循环，把同一时刻的健康检查
+            # 等请求一起拖住 —— 抓取那一步没阻塞，解析这一步却阻塞了，等于白做。
+            # 整段挪进线程，只 await 一次拿结果。
+            result = await asyncio.to_thread(self._parse_rankings, rankings, directory)
             if not result:
                 raise RuntimeError("AKShare 基金排行未产生有效基金记录")
             self.status.status = "ACTIVE"
             self.status.last_error = ""
-            self.status.last_success_at = datetime.now(timezone.utc)
+            self.status.last_success_at = datetime.now(UTC)
             return result
-        except Exception as exc:  # pragma: no cover - depends on external provider
+        except Exception as exc:  # noqa: BLE001 - 上游能抛什么无法穷举；错误已进 status
             self.status.status = "ERROR"
             self.status.last_error = str(exc)[:240]
             return []
+
+    def _parse_rankings(self, rankings: Any, directory: Any) -> list[Fund]:
+        """把 AKShare 的两张原始表解析成 Fund 列表。
+
+        纯同步实现，内部没有任何 await —— **调用方负责把它放进线程**，
+        见 `list_funds`。直接在主协程里调用会阻塞事件循环。
+        """
+        directory_by_code = {
+            str(row.get("基金代码", "")).zfill(6): row
+            for _, row in directory.iterrows()
+        } if directory is not None else {}
+        result = []
+        for index, row in rankings.head(500).iterrows():
+            code = str(row.get("基金代码", "")).zfill(6)
+            if not code or code == "000000":
+                continue
+            directory_row = directory_by_code.get(code, {})
+            name = str(row.get("基金简称") or directory_row.get("基金简称") or code)
+            result.append(self._ranked_fund(code, name, row, directory_row, index))
+        return result
 
     async def history(self, code: str, period: str = "1年") -> list[dict[str, Any]]:
         if not self.enabled:
             self.status.status = "NOT_CONFIGURED"
             return []
-        self.status.last_attempt_at = datetime.now(timezone.utc)
+        self.status.last_attempt_at = datetime.now(UTC)
         try:
             import akshare as ak
 
@@ -103,9 +116,9 @@ class AKShareProvider:
                 raise RuntimeError(f"AKShare 基金 {code} 历史净值返回空数据")
             self.status.status = "ACTIVE"
             self.status.last_error = ""
-            self.status.last_success_at = datetime.now(timezone.utc)
+            self.status.last_success_at = datetime.now(UTC)
             return records
-        except Exception as exc:  # pragma: no cover - depends on external provider
+        except Exception as exc:  # noqa: BLE001 - 上游能抛什么无法穷举；错误已进 status
             self.status.status = "ERROR"
             self.status.last_error = str(exc)[:240]
             return []
@@ -115,11 +128,11 @@ class AKShareProvider:
         if not self.enabled:
             self.status.status = "NOT_CONFIGURED"
             return []
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if self._etf_quotes_fetched_at and (now - self._etf_quotes_fetched_at).total_seconds() < 60:
             return self._etf_quotes
         async with self._etf_refresh_lock:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             if self._etf_quotes_fetched_at and (now - self._etf_quotes_fetched_at).total_seconds() < 60:
                 return self._etf_quotes
             self.status.last_attempt_at = now
@@ -156,7 +169,7 @@ class AKShareProvider:
                 self.status.last_error = ""
                 self.status.last_success_at = now
                 return items
-            except Exception as exc:  # pragma: no cover - depends on external provider
+            except Exception as exc:  # noqa: BLE001 - 上游能抛什么无法穷举；错误已进 status
                 self.status.status = "ERROR"
                 self.status.last_error = str(exc)[:240]
                 return self._etf_quotes
@@ -256,13 +269,13 @@ class DataRepository:
         self.funds = {item.code: item for item in items}
         self.histories.clear()
         self._history_fetched_at.clear()
-        self._funds_fetched_at = datetime.now(timezone.utc)
+        self._funds_fetched_at = datetime.now(UTC)
         return True
 
     def _funds_are_fresh(self) -> bool:
         if not self.funds or self._funds_fetched_at is None:
             return False
-        age = (datetime.now(timezone.utc) - self._funds_fetched_at).total_seconds()
+        age = (datetime.now(UTC) - self._funds_fetched_at).total_seconds()
         return age < self.funds_ttl_seconds
 
     async def ensure_funds(self) -> bool:
@@ -280,23 +293,26 @@ class DataRepository:
             if await self.refresh_funds():
                 return True
             if self.funds:
-                self._funds_fetched_at = datetime.now(timezone.utc)
+                self._funds_fetched_at = datetime.now(UTC)
                 return True
             return False
 
     async def history(self, code: str, period: str) -> list[dict[str, Any]]:
         cache_key = (code, period)
         fetched_at = self._history_fetched_at.get(cache_key)
-        if cache_key in self.histories and fetched_at is not None:
-            if (datetime.now(timezone.utc) - fetched_at).total_seconds() < self.history_ttl_seconds:
-                return self.histories[cache_key]
+        if (
+            cache_key in self.histories
+            and fetched_at is not None
+            and (datetime.now(UTC) - fetched_at).total_seconds() < self.history_ttl_seconds
+        ):
+            return self.histories[cache_key]
         records = await self.provider.history(code, period)
         if not records and cache_key in self.histories:
             # Keep the last good window and defer the retry instead of caching a failure.
-            self._history_fetched_at[cache_key] = datetime.now(timezone.utc)
+            self._history_fetched_at[cache_key] = datetime.now(UTC)
             return self.histories[cache_key]
         self.histories[cache_key] = records
-        self._history_fetched_at[cache_key] = datetime.now(timezone.utc)
+        self._history_fetched_at[cache_key] = datetime.now(UTC)
         return records
 
     def list_funds(self) -> list[Fund]:
@@ -306,6 +322,6 @@ class DataRepository:
         return self.funds.get(code)
 
     def add_watch(self, fund: Fund, note: str = "", tags: list[str] | None = None) -> dict[str, Any]:
-        item = {"fund": fund, "note": note, "reasonTags": tags or [], "addedAt": datetime.now(timezone.utc).isoformat()}
+        item = {"fund": fund, "note": note, "reasonTags": tags or [], "addedAt": datetime.now(UTC).isoformat()}
         self.watchlist[fund.code] = item
         return item

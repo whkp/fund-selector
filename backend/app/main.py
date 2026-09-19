@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import logging
 import re
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,7 @@ from .models import Fund
 from .providers import AKShareProvider, DataRepository
 from .security import EmailFormatError, PasswordPolicyError
 
+logger = logging.getLogger(__name__)
 
 MODE = str(config_value("app", "mode", "REFERENCE", env_name="FUND_COMPASS_MODE")).upper()
 if MODE not in {"LOCAL", "REFERENCE", "PRODUCTION"}:
@@ -53,16 +54,17 @@ async def _warm_up() -> None:
     """Warm the fund universe so the first request after a cold start is fast."""
     try:
         await repository.ensure_funds()
-    except Exception:
-        # Warm-up failure must not block startup; the first request retries.
-        pass
+    except Exception as exc:  # noqa: BLE001 - 上游数据源能抛的异常类型无法穷举
+        # 预热失败不能挡住启动：第一次请求会再试一次。
+        # 但不能静默 —— 冷启动时数据源出问题，这条记录是唯一的线索。
+        logger.warning("基金目录预热失败：%s", exc)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     try:
         print(f"[startup] {await migrate_module.ensure_schema()}", file=sys.stderr)
-    except Exception as exc:  # pragma: no cover - 取决于部署环境
+    except Exception as exc:  # noqa: BLE001 - 不挡住服务是刻意的，失败已经打到 stderr
         # 迁移失败必须可见，但不能挡住整个服务：基金数据接口仍可读。
         # 注意这里**不**回退到 create_all —— 迁移失败说明结构变更没落地，
         # 静默降级只会把问题推迟到第一次查询报错。
@@ -76,7 +78,7 @@ async def lifespan(_: FastAPI):
         if auth_module.invite_policy().get("inviteRequired"):
             print("[startup] 完整邀请码请运行 scripts\\show-invite-code.cmd 查看（日志只打掩码）",
                   file=sys.stderr)
-    except Exception as exc:  # pragma: no cover - 取决于部署环境
+    except Exception as exc:  # noqa: BLE001 - 不挡住服务是刻意的，失败已经打到 stderr
         print(f"[startup] 邀请码策略读取失败：{exc}", file=sys.stderr)
     warmup = asyncio.create_task(_warm_up())
     try:
@@ -103,7 +105,9 @@ async def request_context(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID", f"req_{uuid.uuid4().hex[:12]}")
     try:
         response = await call_next(request)
-    except Exception:
+    except Exception:  # noqa: BLE001 - 兜底中间件，职责就是接住一切未处理异常
+        # 必须留日志：不记的话客户端只拿到 500 + requestId，服务端没有任何线索。
+        logger.exception("未处理的服务端异常 request_id=%s", request_id)
         response = JSONResponse(
             status_code=500,
             content={"error": {"code": "INTERNAL_ERROR", "message": "服务内部错误", "requestId": request_id, "retryable": False}},
@@ -112,6 +116,16 @@ async def request_context(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+    # CSP 属于纵深防御，不是补漏：前端零 v-html，本来就没有 XSS 注入点。
+    # style-src 必须留 'unsafe-inline' —— 组件里有内联的 style 绑定。
+    # connect-src 'self' 够用，因为前后端同源；若将来前端单独托管，要改成后端地址。
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "
+        "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    )
+    # HSTS 按 RFC 6797 只在 HTTPS 响应上生效，所以本地跑 http 不会被锁到 https。
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
@@ -316,15 +330,13 @@ def unverified_note(funds: list[Fund], filters: Filters) -> str:
 def empty_pool_reason(filters: Filters, universe: list[Fund]) -> str:
     """候选为空时，指出是哪一条约束把集合清空了，而不是只说一句"没有候选"。"""
     reasons: list[str] = []
-    if filters.fundTypes:
-        if not any(type_matches(fund.type, filters.fundTypes) for fund in universe):
-            available = sorted({re.split(TYPE_SEPARATORS, str(fund.type or ""))[0].strip() for fund in universe if fund.type})
-            reasons.append(
-                f"类型「{'、'.join(filters.fundTypes)}」在当前数据源中没有匹配项（现有类型：{'、'.join(available) or '无'}）"
-            )
-    if filters.maxFee:
-        if not any(fund.fee is None or fund.fee <= filters.maxFee for fund in universe):
-            reasons.append(f"管理费上限 {filters.maxFee}% 没有基金满足")
+    if filters.fundTypes and not any(type_matches(fund.type, filters.fundTypes) for fund in universe):
+        available = sorted({re.split(TYPE_SEPARATORS, str(fund.type or ""))[0].strip() for fund in universe if fund.type})
+        reasons.append(
+            f"类型「{'、'.join(filters.fundTypes)}」在当前数据源中没有匹配项（现有类型：{'、'.join(available) or '无'}）"
+        )
+    if filters.maxFee and not any(fund.fee is None or fund.fee <= filters.maxFee for fund in universe):
+        reasons.append(f"管理费上限 {filters.maxFee}% 没有基金满足")
     if filters.riskLevelMax:
         cap = RISK_RANK.get(filters.riskLevelMax, 99)
         if not any((not is_known(fund.risk)) or RISK_RANK.get(fund.risk, 99) <= cap for fund in universe):
@@ -335,7 +347,7 @@ def empty_pool_reason(filters: Filters, universe: list[Fund]) -> str:
 def envelope(items: Any) -> dict[str, Any]:
     source = provider.status.as_dict()
     quality = "REFERENCE" if MODE != "PRODUCTION" else ("ACTIVE" if PRODUCTION_DATA_READY else "UNAVAILABLE")
-    return {"items": items, "asOf": datetime.now(timezone.utc).date().isoformat(),
+    return {"items": items, "asOf": datetime.now(UTC).date().isoformat(),
             "snapshotId": f"{MODE.lower()}-snapshot", "qualityStatus": quality,
             "mode": MODE, "dataMode": MODE, "sourceType": source["sourceType"],
             "trustLevel": source["trustLevel"]}
@@ -491,7 +503,7 @@ async def me(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
 @app.post("/api/auth/logout", status_code=204)
 async def logout(user: UserRecord = Depends(current_user)) -> None:
     """JWT 是无状态的：登出即由客户端丢弃令牌。保留端点便于前端统一调用。"""
-    return None
+    return
 
 
 @app.get("/api/conversations")
@@ -727,8 +739,8 @@ async def create_run(
                                      "caveat": "；".join(assessment.riskFlags) or original.caveat}), assessment))
     run_id = f"run_{uuid.uuid4().hex[:12]}"
     run = {"runId": run_id, "status": "COMPLETED", "mode": f"{MODE}_LLM_RESEARCH",
-           "originalQuery": request.query, "createdAt": datetime.now(timezone.utc).isoformat(),
-           "completedAt": datetime.now(timezone.utc).isoformat(), "policyVersion": "research-policy-v1",
+           "originalQuery": request.query, "createdAt": datetime.now(UTC).isoformat(),
+           "completedAt": datetime.now(UTC).isoformat(), "policyVersion": "research-policy-v1",
            "modelVersion": f"{research_llm.provider}:{research_llm.model}", "snapshotId": f"{MODE.lower()}-snapshot",
            "interpretation": {"intent": model_output.intent, "themes": model_output.themes,
                               "ambiguities": model_output.ambiguities, "provider": research_llm.provider, "status": "COMPLETED"},
@@ -834,7 +846,7 @@ async def remove_watch(code: str, user: UserRecord = Depends(current_user)) -> N
 @app.get("/api/profile/risk")
 async def get_profile(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     return {"riskLevel": "中高风险", "investmentHorizonMonths": 36, "liquidityNeed": "低", "goalType": "长期积累",
-            "confirmedAt": datetime.now(timezone.utc).isoformat(), "questionnaireVersion": "risk-questionnaire-v1"}
+            "confirmedAt": datetime.now(UTC).isoformat(), "questionnaireVersion": "risk-questionnaire-v1"}
 
 
 # ---------------------------------------------------------------------------

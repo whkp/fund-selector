@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from ipaddress import ip_address
-from urllib.parse import urlparse
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
@@ -87,7 +86,7 @@ class LLMService:
             "llm", "timeout_seconds", 45, env_name="FUND_COMPASS_LLM_TIMEOUT_SECONDS"
         ))))
 
-    def for_session_request(self, overrides: dict[str, Any]) -> "LLMService":
+    def for_session_request(self, overrides: dict[str, Any]) -> LLMService:
         service = LLMService(overrides)
         service.validate_session_endpoint()
         return service
@@ -115,10 +114,19 @@ class LLMService:
                 raise LLMConfigurationError("不允许访问内网模型地址")
         except ValueError:
             pass
-        allowed = {host.strip().lower() for host in str(os.getenv(
-            "FUND_COMPASS_LLM_ALLOWED_HOSTS",
-            "api.openai.com,api.deepseek.com,dashscope.aliyuncs.com,api.moonshot.cn,api.siliconflow.cn,openrouter.ai,api.z.ai"
-        )).split(",") if host.strip()}
+        # 走 config_value 而不是 os.getenv：项目里其余 20+ 处配置都是
+        # 「环境变量 → config 文件 → 默认值」三级回退，只有这里例外，
+        # 结果白名单只能靠环境变量改，写不进 config/fund-compass.json。
+        configured_hosts = config_value(
+            "llm", "allowed_hosts",
+            "api.openai.com,api.deepseek.com,dashscope.aliyuncs.com,api.moonshot.cn,"
+            "api.siliconflow.cn,openrouter.ai,api.z.ai",
+            env_name="FUND_COMPASS_LLM_ALLOWED_HOSTS",
+        )
+        # config 文件里可以写成数组，环境变量只能是逗号分隔的串，两种都收。
+        if isinstance(configured_hosts, str):
+            configured_hosts = configured_hosts.split(",")
+        allowed = {str(host).strip().lower() for host in configured_hosts if str(host).strip()}
         if parsed.hostname.lower() not in allowed:
             raise LLMConfigurationError("该模型域名未在服务端白名单中")
 
