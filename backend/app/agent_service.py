@@ -116,6 +116,8 @@ class AgentResearchService:
             "研究完成后，最后一条回复必须**只**输出一个 JSON 对象，不要 Markdown、"
             "不要解释文字。字段名和层级必须与下面结构完全一致：\n"
             f"{RESEARCH_OUTPUT_SHAPE}\n"
+            "长度约束：summary 控制在 800 字以内，每条 ranking 的 fit/reason 各不超过 120 字"
+            "——输出超长会被截断导致整份结果作废，精简比详尽更重要。\n"
             "ranking 中的 fundCode 必须是工具结果里出现过的基金代码，最多返回用户要求的数量。"
         )
 
@@ -151,6 +153,8 @@ class AgentResearchService:
             raise LLMError("Agent 模式未启用")
         provider, tools, state = self._build()
         state["seen_codes"] = set()
+        state["call_cache"] = {}  # 每轮研究独立去重缓存（agent_tools 的 dedup 层读写）
+        state["duplicate_calls"] = 0
         harness = AgentHarness(
             AgentHarnessConfig(
                 provider=provider,
@@ -164,12 +168,16 @@ class AgentResearchService:
         trace: list[dict[str, str]] = []
         final_text = ""
 
+        final_stop_reason = "stop"
+
         async def _consume(events: AsyncIterator[Any]) -> None:
-            nonlocal final_text
+            nonlocal final_text, final_stop_reason
             async for event in events:
                 if isinstance(event, ToolExecutionEndEvent):
                     result_text = event.result.text if event.result is not None else ""
                     detail = f"工具 {event.tool_name} 执行{'成功' if not event.is_error else '失败'}"
+                    if state.get("last_call_duplicate"):
+                        detail += "（重复调用，已返回缓存结果）"
                     if not event.is_error:
                         try:
                             payload = json.loads(result_text)
@@ -188,6 +196,7 @@ class AgentResearchService:
                         final_text = "".join(
                             block.text for block in event.message.content if isinstance(block, TextContent)
                         )
+                        final_stop_reason = event.message.stop_reason or "stop"
 
         await _consume(harness.prompt(query))
 
@@ -201,13 +210,18 @@ class AgentResearchService:
                 return None
 
         output = _try_parse(final_text)
+        if output is None and final_stop_reason == "length":
+            # 输出被 token 上限截断：JSON 必然残缺，让模型"重说一遍"只会再截断一次，
+            # 直接抛错走降级链路（旧链路有 response_format=json_object 兜底）。
+            raise LLMResponseError("Agent 最终输出因模型长度上限被截断，无法解析")
         if output is None:
             # 最终输出不是合法 JSON（实测长输出时模型会出尾逗号/漏冒号等格式错）。
             # 让模型自己修一次比正则打地鼠可靠：把坏文本原样退回，要求只回 JSON。
             repair_prompt = (
                 "你上一条回复不是合法 JSON，无法被程序解析。请重新输出：只输出一个 JSON 对象，"
                 "字段与之前要求的结构完全一致（intent/themes/ambiguities/summary/ranking/"
-                "followUpQuestions），不要 Markdown 代码块，不要任何解释文字。"
+                "followUpQuestions），不要 Markdown 代码块，不要任何解释文字，"
+                "summary 和各条说明尽量精简以免超长。"
             )
             harness.append_message(UserMessage(content=repair_prompt))
             final_text = ""

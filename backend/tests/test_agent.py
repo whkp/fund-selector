@@ -192,6 +192,51 @@ def test_screen_tool_supports_within_theme_ranking():
     assert payload_empty["totalPassed"] == 0 and "无法在池内筛选" in payload_empty["note"]
 
 
+def test_duplicate_tool_calls_are_deduped():
+    """同一轮研究内参数相同的重复调用返回缓存结果，且带上 duplicate 提示。"""
+    import asyncio
+
+    repo = StubRepository({"008286": reference_fund("008286", 90)})
+    tools, state = build_fund_tools(
+        repository=repo, knowledge_base=StubKnowledge(), compact_fund=LLMService._compact_fund,
+    )
+    detail = next(t for t in tools if t.name == "get_fund_detail")
+    first = asyncio.run(detail.execute("c1", {"code": "008286"}))
+    again = asyncio.run(detail.execute("c2", {"code": "008286"}))
+    payload = json.loads(again.text)
+    assert payload.get("duplicate") is True
+    assert "重复调用" in payload.get("note", "")
+    assert payload["fundCode"] == json.loads(first.text)["fundCode"]
+    assert state["duplicate_calls"] == 1
+
+    # fund_history 去重省掉上游请求：同参数两次，repository.history 只被真实调 1 次
+    history = next(t for t in tools if t.name == "fund_history")
+    asyncio.run(history.execute("c3", {"code": "008286", "period": "1Y"}))
+    asyncio.run(history.execute("c4", {"code": "008286", "period": "1Y"}))
+    assert repo.history_calls == [("008286", "1Y")]
+    # 参数不同不去重
+    asyncio.run(history.execute("c5", {"code": "008286", "period": "3M"}))
+    assert repo.history_calls == [("008286", "1Y"), ("008286", "3M")]
+
+
+def test_screen_tool_zero_coverage_guard():
+    """对数据源未覆盖的字段（drawdown/scale）设阈值时，返回数据边界说明而非空结果。"""
+    import asyncio
+
+    repo = StubRepository({"008286": reference_fund("008286", 90)})  # drawdown=None
+    tools, _state = build_fund_tools(
+        repository=repo, knowledge_base=StubKnowledge(), compact_fund=LLMService._compact_fund,
+    )
+    tool = next(t for t in tools if t.name == "screen_funds")
+    result = asyncio.run(tool.execute("c6", {"maxDrawdown": 20}))
+    payload = json.loads(result.text)
+    assert payload["totalPassed"] == 0
+    assert "无法应用" in payload["note"] and "fund_history" in payload["note"]
+    # 有覆盖的条件不受影响
+    ok = asyncio.run(tool.execute("c7", {"minOneYear": 11}))
+    assert json.loads(ok.text)["totalPassed"] == 1
+
+
 def test_agent_loop_happy_path():
     repo = StubRepository({"161725": reference_fund("161725", 90)})
     repo.funds["161725"].theme = "白酒"

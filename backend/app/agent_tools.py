@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -28,6 +29,48 @@ def _json_result(data: Any) -> AgentToolResult:
 
 def _error_result(message: str) -> AgentToolResult:
     return AgentToolResult(content=[TextContent(text=message)], details={})
+
+
+def _dedup_wrapper(name: str, fn: Any, state: dict[str, Any]) -> Any:
+    """同一轮研究内，参数完全相同的重复调用直接返回缓存结果。
+
+    实测 qwen3.8-flash 会连续用相同参数调 search_knowledge（E2E 里 3 次）；
+    对 fund_history 这类上游接口调用，去重同时省掉一次 AKShare 请求。
+    缓存结果带上 duplicate 标记提示模型别再重复，行为对 harness 透明。
+    """
+
+    async def wrapped(
+        tool_call_id: str,
+        arguments: Mapping[str, JSONValue],
+        signal: object = None,
+        on_update: object = None,
+    ) -> AgentToolResult:
+        cache: dict[str, AgentToolResult] = state.setdefault("call_cache", {})
+        key = json.dumps([name, dict(arguments)], ensure_ascii=False, sort_keys=True, default=str)
+        if key in cache:
+            state["duplicate_calls"] = state.get("duplicate_calls", 0) + 1
+            state["last_call_duplicate"] = True
+            cached_text = cache[key].text
+            note = "本工具刚以完全相同的参数调用过，以上为缓存结果；请直接使用已有信息继续分析，不要再重复调用。"
+            try:
+                payload = json.loads(cached_text)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                payload["duplicate"] = True
+                existing_note = payload.get("note")
+                payload["note"] = f"{existing_note}；{note}" if existing_note else note
+                return AgentToolResult(
+                    content=[TextContent(text=json.dumps(payload, ensure_ascii=False))], details={}
+                )
+            return AgentToolResult(content=[TextContent(text=f"{cached_text}\n[{note}]")], details={})
+
+        state["last_call_duplicate"] = False
+        result = await fn(tool_call_id, arguments, signal, on_update)
+        cache[key] = result
+        return result
+
+    return wrapped
 
 
 def build_fund_tools(
@@ -125,6 +168,32 @@ def build_fund_tools(
         sort_by = str(arguments.get("sortBy", "oneYear")).strip()
         limit = min(max(int(arguments.get("limit", 10)), 1), 20)
 
+        # 零覆盖守卫：数据源目前不产出 drawdown/scale 等字段，若模型对全空字段
+        # 设阈值必然得到 0 结果且误以为「没有匹配」。提前给出数据边界说明。
+        _CONDITION_FIELDS = {
+            "maxDrawdown": "drawdown",
+            "minScale": "scale",
+            "minOneYear": "one_year",
+            "maxFee": "fee",
+        }
+
+        def _numeric(field_value: Any) -> float | None:
+            return field_value if isinstance(field_value, (int, float)) else None
+
+        for arg_name, field_name in _CONDITION_FIELDS.items():
+            if arguments.get(arg_name) is None:
+                continue
+            if not any(_numeric(getattr(fund, field_name, None)) is not None for fund in universe):
+                return _json_result({
+                    "totalPassed": 0,
+                    "matches": [],
+                    "note": (
+                        f"条件 {arg_name} 无法应用：当前数据源未覆盖 {field_name} 字段"
+                        f"（全池均为空）。不要据此认为没有匹配；需要该指标时用 fund_history "
+                        f"取净值后自行计算，或改用其他可用条件（oneYear/ytd/fee/type）。"
+                    ),
+                })
+
         def _num(value: JSONValue) -> float | None:
             if value is None or value == "":
                 return None
@@ -132,9 +201,6 @@ def build_fund_tools(
                 return float(value)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 return None
-
-        def _numeric(field_value: Any) -> float | None:
-            return field_value if isinstance(field_value, (int, float)) else None
 
         passed: list[Any] = []
         for fund in universe:
@@ -236,6 +302,9 @@ def build_fund_tools(
                 "参数口径：minOneYear/maxDrawdown/minScale/maxFee 均为百分数或亿元数值，"
                 "是筛选阈值；limit 只是返回条数上限，不能当阈值用。"
                 "带阈值条件时字段缺失（null）的基金会被剔除，这是数据边界，不要靠放宽条件硬凑。"
+                "当前数据源字段可用性：oneYear/ytd/fee/type/nav 有值；"
+                "drawdown/scale/volatility/risk 未覆盖（对它们设阈值会收到数据边界说明，"
+                "需要这些指标时用 fund_history 自行计算）。"
             ),
             parameters={
                 "type": "object",
@@ -299,4 +368,9 @@ def build_fund_tools(
             execute_fn=search_knowledge,
         ),
     ]
-    return tools, state
+    # 每个工具都包一层去重：同一轮研究内参数完全相同的重复调用返回缓存结果。
+    wrapped = [
+        dataclasses.replace(tool, execute_fn=_dedup_wrapper(tool.name, tool.execute_fn, state))
+        for tool in tools
+    ]
+    return wrapped, state
