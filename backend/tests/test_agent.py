@@ -149,6 +149,49 @@ def test_get_fund_detail_unknown_code_is_tool_error():
     assert state["seen_codes"] == set()
 
 
+def test_fund_code_guard_rejects_malformed_codes():
+    """防幻觉护栏：非 6 位数字代码直接打回，禁止模型猜代码。"""
+    import asyncio
+
+    repo = StubRepository({"008286": reference_fund("008286", 90)})
+    tools, _state = build_fund_tools(
+        repository=repo, knowledge_base=StubKnowledge(), compact_fund=LLMService._compact_fund,
+    )
+    detail = next(t for t in tools if t.name == "get_fund_detail")
+    history = next(t for t in tools if t.name == "fund_history")
+    for tool, bad_code in [(detail, "16172"), (detail, "abc123"), (history, "161725.SZ"), (history, "")]:
+        result = asyncio.run(tool.execute("call_x", {"code": bad_code}))
+        assert "6 位数字" in result.text or "不能为空" in result.text, (tool.name, bad_code)
+
+
+def test_screen_tool_supports_within_theme_ranking():
+    """池内二次排序：query 先圈主题池，再在池内应用条件与排序（对应 --within-* 语义）。"""
+    import asyncio
+    from dataclasses import replace
+
+    liquor_a = replace(reference_fund("161725", 90), theme="白酒", name="招商中证白酒A")
+    liquor_b = replace(reference_fund("012414", 70), theme="白酒", name="招商中证白酒C")
+    other = reference_fund("008286", 99)  # 收益更高但不在白酒池里
+    repo = StubRepository({"161725": liquor_a, "012414": liquor_b, "008286": other})
+    tools, state = build_fund_tools(
+        repository=repo, knowledge_base=StubKnowledge(), compact_fund=LLMService._compact_fund,
+    )
+    tool = next(t for t in tools if t.name == "screen_funds")
+
+    result = asyncio.run(tool.execute("call_4", {"query": "白酒", "sortBy": "oneYear", "limit": 10}))
+    payload = json.loads(result.text)
+    assert payload["poolSize"] == 2
+    assert payload["totalPassed"] == 2
+    assert [m["fundCode"] for m in payload["matches"]] == ["161725", "012414"]
+    assert "008286" not in {m["fundCode"] for m in payload["matches"]}
+    # 池内命中的代码都要进 seen_codes，供最终 ranking 校验
+    assert {"161725", "012414"} <= state["seen_codes"]
+
+    empty = asyncio.run(tool.execute("call_5", {"query": "量子计算"}))
+    payload_empty = json.loads(empty.text)
+    assert payload_empty["totalPassed"] == 0 and "无法在池内筛选" in payload_empty["note"]
+
+
 def test_agent_loop_happy_path():
     repo = StubRepository({"161725": reference_fund("161725", 90)})
     repo.funds["161725"].theme = "白酒"

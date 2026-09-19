@@ -71,6 +71,16 @@ def build_fund_tools(
         matches = [_pack(fund) for fund in funds[:limit]]
         return _json_result({"totalRelevant": len(scores), "matches": matches})
 
+    _SIX_DIGITS = set("0123456789")
+
+    def _check_code(code: str) -> str | None:
+        """防幻觉护栏：基金代码必须是 6 位数字，禁止模型猜代码。"""
+        if not code:
+            return "code 不能为空"
+        if len(code) != 6 or not set(code) <= _SIX_DIGITS:
+            return f"基金代码必须是 6 位数字，收到「{code}」不合法；禁止猜测代码，请先用 search_funds 查询。"
+        return None
+
     async def get_fund_detail(
         _tool_call_id: str,
         arguments: Mapping[str, JSONValue],
@@ -78,9 +88,12 @@ def build_fund_tools(
         _on_update: object = None,
     ) -> AgentToolResult:
         code = str(arguments.get("code", "")).strip()
-        fund = repository.get_fund(code) if code else None
+        invalid = _check_code(code)
+        if invalid:
+            return _error_result(invalid)
+        fund = repository.get_fund(code)
         if fund is None:
-            return _error_result(f"未找到基金代码 {code or '(空)'}，请先用 search_funds 确认代码。")
+            return _error_result(f"未找到基金代码 {code}，请先用 search_funds 确认代码。")
         return _json_result(_pack(fund))
 
     async def screen_funds(
@@ -90,6 +103,19 @@ def build_fund_tools(
         _on_update: object = None,
     ) -> AgentToolResult:
         universe = repository.list_funds()
+        query = str(arguments.get("query", "")).strip()
+        if query:
+            # 池内筛选（对应专业选股工具的 within 语义）：先用相关性索引圈主题池，
+            # 再在池内应用量化条件与排序 ——「白酒里回撤最小」一类复合问题一步到位。
+            scores = repository.relevance_scores(query)
+            allowed = {code for code, score in (scores or {}).items() if score > 0}
+            universe = [fund for fund in universe if fund.code in allowed]
+            if not universe:
+                return _json_result({
+                    "totalPassed": 0,
+                    "matches": [],
+                    "note": f"没有与「{query}」主题相关的基金，无法在池内筛选；可先用 search_funds 换关键词确认。",
+                })
         fund_type = str(arguments.get("fundType", "")).strip().lower()
         risk = arguments.get("maxRisk")
         min_one_year = arguments.get("minOneYear")
@@ -141,7 +167,11 @@ def build_fund_tools(
         }
         passed.sort(key=sort_keys.get(sort_by, sort_keys["oneYear"]))
         matches = [_pack(fund) for fund in passed[:limit]]
-        return _json_result({"totalPassed": len(passed), "matches": matches})
+        payload: dict[str, Any] = {"totalPassed": len(passed), "matches": matches}
+        if query:
+            payload["poolSize"] = len(universe)
+            payload["note"] = f"先按「{query}」圈定 {len(universe)} 只主题池，再应用条件筛选。"
+        return _json_result(payload)
 
     async def search_knowledge(
         _tool_call_id: str,
@@ -165,8 +195,9 @@ def build_fund_tools(
     ) -> AgentToolResult:
         code = str(arguments.get("code", "")).strip()
         period = str(arguments.get("period", "1M")).strip() or "1M"
-        if not code:
-            return _error_result("code 不能为空")
+        invalid = _check_code(code)
+        if invalid:
+            return _error_result(invalid)
         if repository.get_fund(code) is None:
             return _error_result(f"未找到基金代码 {code}，请先用 search_funds 确认代码。")
         try:
@@ -183,6 +214,7 @@ def build_fund_tools(
             description=(
                 "按关键词（主题/名称/公司/经理等中文片段）在全部基金里搜索，"
                 "返回按相关性排序的匹配列表。中文不需要分词，直接给主题词如「白酒」「红利」。"
+                "用于主题发现；找到候选代码后再用 get_fund_detail 精查单只。"
             ),
             parameters={
                 "type": "object",
@@ -198,12 +230,17 @@ def build_fund_tools(
             name="screen_funds",
             label="筛选基金",
             description=(
-                "按量化条件筛选全部基金：类型、风险等级、最低近一年收益、回撤上限、"
-                "最低规模、费率上限，并可按收益/回撤/规模/费率排序。"
+                "按量化条件在基金全集（或指定主题池内）筛选并排序。"
+                "工具选择规则：主题契合看 query，收益/回撤/规模/费率条件看阈值参数，"
+                "「某主题里 XX 最优」的复合问题用 query + sortBy 一步完成，不要先搜再手工过滤。"
+                "参数口径：minOneYear/maxDrawdown/minScale/maxFee 均为百分数或亿元数值，"
+                "是筛选阈值；limit 只是返回条数上限，不能当阈值用。"
+                "带阈值条件时字段缺失（null）的基金会被剔除，这是数据边界，不要靠放宽条件硬凑。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
+                    "query": {"type": "string", "description": "可选；先按主题关键词圈定池子再筛选，如「白酒」"},
                     "fundType": {"type": "string", "description": "类型关键词，如「混合」「指数」"},
                     "maxRisk": {"type": "integer", "description": "最高风险等级 1-5"},
                     "minOneYear": {"type": "number", "description": "近一年收益率下限（百分数）"},
@@ -219,7 +256,10 @@ def build_fund_tools(
         AgentTool(
             name="get_fund_detail",
             label="基金详情",
-            description="按 6 位基金代码取单只基金的完整字段（经理/主题/回撤/波动率/规模/费率等）。",
+            description=(
+                "按 6 位基金代码取单只基金的完整字段（经理/主题/回撤/波动率/规模/费率等）。"
+                "code 必须是 search_funds / screen_funds 结果里出现过的 6 位数字代码，禁止猜测。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {"code": {"type": "string", "description": "6 位基金代码"}},
@@ -230,7 +270,10 @@ def build_fund_tools(
         AgentTool(
             name="fund_history",
             label="净值历史",
-            description="按代码与周期（如 1M/3M/6M/1Y）取净值走势记录，用于看波动与回撤。",
+            description=(
+                "按代码与周期（如 1M/3M/6M/1Y）取净值走势记录，用于看波动与回撤。"
+                "code 必须是工具结果里出现过的 6 位数字代码，禁止猜测。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {

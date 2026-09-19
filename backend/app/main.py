@@ -798,7 +798,10 @@ async def create_run(
                            "sourceSummary": {"primarySourceType": fund.nav_source_type, "officialDisclosureChecked": False, "lowestTrustLevel": fund.nav_trust_level},
                            "recommendationScore": assessment.score} for index, (fund, assessment) in enumerate(ranked_funds)],
            "trace": static_trace,
-           "disclaimer": "内容仅供基金研究参考，不构成投资建议。模型不生成交易指令。", "nextQuestions": model_output.followUpQuestions}
+           "disclaimer": "以上内容基于公开数据和量化分析，仅供参考，不构成投资建议。"
+                         "数据可能存在延迟或缺漏，以基金管理人官方披露为准。"
+                         "市场有风险，投资需谨慎；任何投资决策应结合个人风险承受能力、"
+                         "资金状况和投资目标独立判断，必要时咨询持牌专业机构。过往表现不预示未来收益。", "nextQuestions": model_output.followUpQuestions}
     run["conversationId"] = conversation_id
     repository.runs[run_id] = run
     await auth_module.append_message(
