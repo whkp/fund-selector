@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -14,7 +14,7 @@ from .session import get_session_factory
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def make_id(prefix: str) -> str:
@@ -61,6 +61,7 @@ class SnapshotRepository:
                     payload_text=raw_text, parser_version=parser_version, http_status=200,
                 ))
                 written = 0
+                staged: list[tuple[FundRecord, str, Fund]] = []
                 for fund in funds:
                     record = await session.scalar(select(FundRecord).where(FundRecord.code == fund.code))
                     if record is None:
@@ -71,7 +72,14 @@ class SnapshotRepository:
                         record.name = fund.name
                         record.short_name = fund.short_name
                         record.updated_at = now
-                    profile_id = make_id("profile")
+                    staged.append((record, make_id("profile"), fund))
+                    written += 1
+                # 先把 funds 落库，再写引用它们的 profile 快照。理由同 nav_repository：
+                # 裸 ForeignKey 不参与 SQLAlchemy 的 INSERT 排序，父行必须显式先 flush ——
+                # 否则下一轮循环里的 SELECT 触发 autoflush 时会先插子表，开启
+                # PRAGMA foreign_keys 之后直接外键违约。
+                await session.flush()
+                for record, profile_id, fund in staged:
                     session.add(FundProfileSnapshot(
                         id=profile_id, fund_id=record.id, raw_snapshot_id=raw_id,
                         provider=source_name, company=fund.company, manager=fund.manager,
@@ -82,7 +90,6 @@ class SnapshotRepository:
                         quality_status=fund.quality_status, parser_version=parser_version,
                     ))
                     record.current_profile_snapshot_id = profile_id
-                    written += 1
                 session.add(OutboxEvent(
                     id=make_id("event"), event_type="fund_universe.synced",
                     aggregate_id=raw_id, payload={"rawSnapshotId": raw_id, "fundCount": written},

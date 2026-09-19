@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -14,7 +14,7 @@ from .session import get_session_factory
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def make_id(prefix: str) -> str:
@@ -68,6 +68,11 @@ class NavSnapshotRepository:
                     content_hash=content_hash, payload_text=raw_text,
                     parser_version=parser_version, http_status=200,
                 ))
+                # 先把父行（funds / raw_data_snapshots）落库，再写引用它们的 nav 行。
+                # 不要依赖 SQLAlchemy 的自动排序：那套顺序只在两个 mapper 之间有
+                # relationship() 时才成立，这里只有裸 ForeignKey —— 实测它会把
+                # 子表排在前面，一旦 PRAGMA foreign_keys=ON 就直接外键违约。
+                await session.flush()
                 for record in normalized:
                     session.add(FundNavSnapshot(
                         id=make_id("nav"), fund_id=fund_record.id, source_snapshot_id=raw_id,
