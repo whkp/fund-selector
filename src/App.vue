@@ -306,17 +306,26 @@ function notify(message: string) {
   window.setTimeout(() => { toast.value = '' }, 2600)
 }
 
+/** 正在同步到服务端的观察变更：乐观更新期间拦截重复点击，避免本地出现重复条目。 */
+const watchPending = new Set<string>()
+
 async function toggleWatch(fund: Fund) {
   const existing = watchlist.value.find((item) => item.id === fund.id)
+  if (watchPending.has(fund.id)) return // 上一次变更还没同步完，忽略连点
+  // 乐观更新：先改本地让星标立即响应（服务端写入要走跨洋 Postgres，实测 3~8 秒，
+  // 等它回来再亮星标用户只会觉得按钮坏了），失败时回滚并提示。
+  watchlist.value = existing ? watchlist.value.filter((item) => item.id !== fund.id) : [...watchlist.value, fund]
+  notify(existing ? `已从观察列表移除「${fund.shortName}」` : `已加入观察列表：${fund.shortName}`)
+  if (!apiConnected.value) return
+  watchPending.add(fund.id)
   try {
-    if (apiConnected.value) {
-      if (existing) await removeWatchlistItem(fund)
-      else await addWatchlistItem(fund)
-    }
-    watchlist.value = existing ? watchlist.value.filter((item) => item.id !== fund.id) : [...watchlist.value, fund]
-    notify(existing ? `已从观察列表移除「${fund.shortName}」` : `已加入观察列表：${fund.shortName}`)
+    if (existing) await removeWatchlistItem(fund)
+    else await addWatchlistItem(fund)
   } catch {
-    notify('观察列表保存失败，已保留当前页面状态')
+    watchlist.value = existing ? [...watchlist.value, fund] : watchlist.value.filter((item) => item.id !== fund.id)
+    notify('观察列表同步失败，已恢复原状态')
+  } finally {
+    watchPending.delete(fund.id)
   }
 }
 
