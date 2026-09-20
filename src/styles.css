@@ -211,6 +211,17 @@ button.avatar:hover { transform: scale(1.06); }
 .results-header p { margin: 4px 0 0; color: var(--ink-400); font-size: 10px; }
 .sort-button { display: inline-flex; align-items: center; gap: 4px; padding: 6px 7px; color: var(--ink-500); font-size: 11px; background: transparent; border: 1px solid var(--line); border-radius: 6px; transition: all .16s ease; }
 .sort-button:hover { border-color: #b9c8e2; color: var(--navy-600); }
+
+/* 基金搜索框：名称 / 代码直查全量索引 */
+.search-wrap { position: relative; display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; background: #fff; border: 1px solid var(--line); border-radius: 8px; transition: border-color .16s ease, box-shadow .16s ease; }
+.search-wrap:focus-within { border-color: var(--navy-600); box-shadow: 0 0 0 3px rgba(31, 58, 105, .08); }
+.search-wrap > svg { color: var(--ink-400); flex: none; }
+.search-input { width: 250px; padding: 7px 0; font-size: 12px; color: var(--ink-700); background: transparent; border: none; outline: none; }
+.search-input::placeholder { color: var(--ink-400); }
+.search-wrap .icon-button { flex: none; }
+.search-spinner { position: absolute; right: 34px; width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--navy-600); border-radius: 50%; animation: search-spin .7s linear infinite; }
+@keyframes search-spin { to { transform: rotate(360deg); } }
+@media (max-width: 900px) { .search-input { width: 100%; } .search-wrap { width: 100%; } }
 .sort-button svg:first-child { color: var(--navy-600); }
 
 .fund-card { position: relative; display: grid; grid-template-columns: 44px minmax(210px, 1fr) 106px 58px; gap: 14px; align-items: center; min-height: 150px; margin-top: 9px; padding: 17px 15px 15px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow-sm); transition: transform .22s var(--ease-out), border-color .22s ease, box-shadow .22s var(--ease-out); animation: rise .45s var(--ease-out) both; }

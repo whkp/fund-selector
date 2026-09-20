@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -604,9 +604,29 @@ BROWSE_LIST_LIMIT = 200
 
 
 @app.get("/api/funds")
-async def funds(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+async def funds(
+    q: str = Query(default="", max_length=60),
+    limit: int = Query(default=0, ge=0, le=100),
+    user: UserRecord = Depends(current_user),
+) -> dict[str, Any]:
     require_production_data()
     await repository.ensure_funds()
+    if q.strip():
+        # 按名称/代码搜索：走全量 n-gram 相关性索引（与研究问答同一套打分），
+        # 浏览列表只有前 200 只，深层的基金只能靠这里召回。
+        scores = repository.relevance_scores(q)
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        take = limit or 30
+        hits = [repository.funds[code] for code, _ in ranked[:take] if code in repository.funds]
+        if q.strip().isdigit():
+            # 纯数字按基金代码理解：n-gram 会把 "161725" 的片段错误匹配到
+            # 名称含 "2016" 之类的基金，这里把代码前缀命中强制排到最前。
+            prefix = q.strip()
+            exact = [f for f in repository.funds.values() if f.code == prefix]
+            starts = [f for f in repository.funds.values()
+                      if f.code.startswith(prefix) and f.code != prefix]
+            hits = exact + starts + [f for f in hits if f.code != prefix and not f.code.startswith(prefix)]
+        return envelope([fund.as_dict() for fund in hits[:take]])
     # 浏览视图：按静态分取前 200。全集已放开到 AKShare 全量排行（约 2 万只，
     # 供研究与筛选在服务端用），整包发给前端是十几 MB 的 JSON，浏览器吃不消；
     # 深层的基金通过研究问答按相关性召回，不靠翻这个列表。
@@ -812,12 +832,10 @@ async def create_run(
                     "detail": "模型调用失败，已停止本次研究。可稍后重试。",
                     "status": "FAILED",
                 })
-    # 模型确实产出了结论，此时才建对话并写入这一轮问答。
-    conversation_id = requested_conversation or (await auth_module.create_conversation(user.id, request.query))["id"]
-    await auth_module.append_message(
-        user.id, conversation_id, "user", request.query,
-        payload={"filters": request.filters.model_dump(), "limit": request.limit},
-    )
+    # 对话与消息在 run 载荷完全构建成功后才落库（见函数末尾）：此前 user 消息
+    # 先写、assistant 后写，中间构建载荷一旦抛异常就留下只有用户提问的孤儿
+    # 记录（复盘日志里删之不甘、留之无用）。整体后置让两步写入要么都发生、
+    # 要么都不发生。
     by_code = {item.code: item for item in items}
     ranked_funds: list[tuple[Fund, Any]] = []
     for assessment in model_output.ranking:
@@ -859,6 +877,11 @@ async def create_run(
                          "数据可能存在延迟或缺漏，以基金管理人官方披露为准。"
                          "市场有风险，投资需谨慎；任何投资决策应结合个人风险承受能力、"
                          "资金状况和投资目标独立判断，必要时咨询持牌专业机构。过往表现不预示未来收益。", "nextQuestions": model_output.followUpQuestions}
+    conversation_id = requested_conversation or (await auth_module.create_conversation(user.id, request.query))["id"]
+    await auth_module.append_message(
+        user.id, conversation_id, "user", request.query,
+        payload={"filters": request.filters.model_dump(), "limit": request.limit},
+    )
     run["conversationId"] = conversation_id
     repository.runs[run_id] = run
     await auth_module.append_message(

@@ -9,6 +9,7 @@ import {
 import type { Fund } from './types'
 import {
   addWatchlistItem, createResearchRun, fetchAIStatus, fetchFunds, fetchFundHistory, fetchMarketQuotes, fetchRunTrace,
+  searchFunds,
   fetchWatchlist, refreshMarketQuotes, removeWatchlistItem, type MarketQuote, type MarketQuoteResponse,
   type AIStatus, type FundHistoryResponse, type MarketSourceStatus, type ResearchRun, type RunTrace, type SessionLLMConfig
 } from './services/fund-api'
@@ -154,6 +155,52 @@ const displayedFunds = computed(() => {
     .filter((fund) => fund.fee === null || fund.fee <= maxFee.value)
     .slice(0, 30)
 })
+
+// ---- 按名称/代码直接搜索：不走研究流程，从全量 n-gram 索引里召回任意基金 ----
+const searchKeyword = ref('')
+const searchActive = ref(false)
+const isSearching = ref(false)
+let searchTimer: number | undefined
+
+async function runSearch() {
+  const keyword = searchKeyword.value.trim()
+  if (!keyword) {
+    clearSearch()
+    return
+  }
+  isSearching.value = true
+  try {
+    const hits = await searchFunds(keyword)
+    if (searchKeyword.value.trim() !== keyword) return // 关键词已变，丢弃过期结果
+    searchActive.value = true
+    // 搜索结果按关键词直接命中，重置类型/主题避免旧筛选把结果滤空
+    fundType.value = '不限'
+    theme.value = '不限主题'
+    availableFunds.value = hits
+    notify(hits.length
+      ? `找到 ${hits.length} 只与「${keyword}」相关的基金`
+      : `没有找到与「${keyword}」相关的基金，试试基金全名或 6 位代码`)
+  } catch {
+    notify('搜索失败，请稍后重试')
+  } finally {
+    isSearching.value = false
+  }
+}
+
+function onSearchInput() {
+  window.clearTimeout(searchTimer)
+  searchTimer = window.setTimeout(runSearch, 450)
+}
+
+function clearSearch() {
+  window.clearTimeout(searchTimer)
+  searchKeyword.value = ''
+  if (!searchActive.value) return
+  searchActive.value = false
+  // 回到浏览视图（前 200 只）；若之前在看研究结果则一并清掉
+  latestRun.value = null
+  availableFunds.value = fundUniverse.value
+}
 
 /** 数据源给不出风险等级时（候选全部"未获取"），风险上限条件实际不参与筛选，界面要如实说明。 */
 const riskFilterUsable = computed(() => displayedFunds.value.some((fund) => isKnown(fund.risk)))
@@ -492,6 +539,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (marketTimer !== undefined) window.clearInterval(marketTimer)
+  window.clearTimeout(searchTimer)
   stopTracePolling()
 })
 </script>
@@ -618,8 +666,22 @@ onBeforeUnmount(() => {
 
             <section class="results-panel">
               <div class="results-header">
-                <div><h2>研究候选 <span>{{ displayedFunds.length }}</span></h2><p>按当前目标与有效数据快照排序</p></div>
-                <button class="sort-button"><Filter :size="15" />综合适配 <ChevronDown :size="14" /></button>
+                <div><h2>{{ searchActive ? '搜索结果' : '研究候选' }} <span>{{ displayedFunds.length }}</span></h2><p>{{ searchActive ? `关键词「${searchKeyword.trim()}」命中（全量索引召回）` : '按当前目标与有效数据快照排序' }}</p></div>
+                <div class="search-wrap">
+                  <Search :size="15" />
+                  <input
+                    v-model="searchKeyword"
+                    class="search-input"
+                    type="text"
+                    placeholder="按基金名称或 6 位代码搜索，如：白酒 / 161725"
+                    aria-label="搜索基金"
+                    @input="onSearchInput"
+                    @keyup.enter="runSearch"
+                    @keydown.esc="clearSearch"
+                  />
+                  <button v-if="searchKeyword || searchActive" class="icon-button" title="清除搜索" aria-label="清除搜索" @click="clearSearch"><X :size="14" /></button>
+                  <span v-if="isSearching" class="search-spinner"></span>
+                </div>
               </div>
               <article v-for="(fund, index) in displayedFunds" :key="fund.id" class="fund-card" :class="{ 'fund-warning': fund.status === '注意' }">
                 <div class="rank-col"><span class="rank">0{{ index + 1 }}</span><span v-if="index === 0" class="rank-note">优先研究</span></div>

@@ -90,6 +90,19 @@ export async function fetchFunds(): Promise<Fund[]> {
   return payload.items
 }
 
+/**
+ * 按名称或代码搜索基金。服务端用全量 n-gram 索引打分，可以召回浏览列表
+ * （前 200 只）之外的深层基金；空结果不代表基金不存在，换个关键词再试。
+ */
+export async function searchFunds(query: string, limit = 30): Promise<Fund[]> {
+  const payload = await request<FundListResponse>(
+    `/funds?q=${encodeURIComponent(query)}&limit=${limit}`,
+    undefined,
+    { timeoutMs: TIMEOUT_MS.upstream },
+  )
+  return payload.items
+}
+
 export type FundHistoryResponse = {
   fundCode: string
   period: string
