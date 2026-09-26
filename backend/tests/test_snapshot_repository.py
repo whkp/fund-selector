@@ -1,4 +1,7 @@
 import asyncio
+import gzip
+import json
+from datetime import UTC, date, datetime
 
 from sqlalchemy import func, select
 
@@ -119,6 +122,73 @@ def test_persist_history_is_idempotent_and_keeps_nav_rows(tmp_path, monkeypatch)
             snapshot = await session.scalar(select(RawDataSnapshot))
             assert snapshot is not None and snapshot.payload_gz is not None
             assert snapshot.payload_text is None
+        await session_module.get_engine().dispose()
+
+    asyncio.run(run())
+
+
+def test_persist_then_load_history_roundtrip(tmp_path, monkeypatch):
+    """历史快照写进去 → 回收出来，数据必须原样还原（按需落库依赖这条路径）。"""
+    db_path = tmp_path / "history-roundtrip.db"
+    monkeypatch.setenv("FUND_COMPASS_DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    session_module._engine = None
+    session_module._session_factory = None
+
+    async def run():
+        async with session_module.get_engine().begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        # 没有快照时返回 None —— 调用方据此回落到实时抓取。
+        assert await NavSnapshotRepository().load_latest_history("000003") is None
+        records = [
+            {"date": "2026-09-08", "nav": 1.0, "dailyChange": 0.0},
+            {"date": "2026-09-09", "nav": 1.1, "dailyChange": 10.0},
+        ]
+        await NavSnapshotRepository().persist_history(
+            make_fund("000003"), records, source_name="AKShare public reference",
+            source_type="AKSHARE_PUBLIC", trust_level="LOW",
+        )
+        loaded = await NavSnapshotRepository().load_latest_history("000003")
+        assert loaded is not None
+        loaded_records, business_date = loaded
+        assert loaded_records == records
+        assert business_date == date(2026, 9, 9)
+        await session_module.get_engine().dispose()
+
+    asyncio.run(run())
+
+
+def test_load_latest_history_prefers_gzip_copy(tmp_path, monkeypatch):
+    """同基金多份快照：gzip 副本优先于遗留明文行，即使明文行抓取时间更新。"""
+    db_path = tmp_path / "history-gz.db"
+    monkeypatch.setenv("FUND_COMPASS_DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    session_module._engine = None
+    session_module._session_factory = None
+
+    async def run():
+        async with session_module.get_engine().begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        gz_records = [{"date": "2026-09-09", "nav": 1.23, "dailyChange": 0.0}]
+        plain_records = [{"date": "2026-09-09", "nav": 9.99, "dailyChange": 0.0}]
+        async with session_module.get_session_factory()() as session, session.begin():
+            session.add(RawDataSnapshot(
+                id="raw_gz", source_name="AKShare public reference",
+                endpoint="fund-history:000004", fetched_at=datetime(2026, 9, 9, 8, 0, tzinfo=UTC),
+                business_date=date(2026, 9, 9), content_hash="hash-gz",
+                payload_gz=gzip.compress(json.dumps(gz_records).encode("utf-8")),
+                parser_version="akshare-history-v1", http_status=200,
+            ))
+            session.add(RawDataSnapshot(
+                id="raw_plain", source_name="AKShare public reference",
+                endpoint="fund-history:000004", fetched_at=datetime(2026, 9, 9, 12, 0, tzinfo=UTC),
+                business_date=date(2026, 9, 9), content_hash="hash-plain",
+                payload_text=json.dumps(plain_records),
+                parser_version="akshare-history-v1", http_status=200,
+            ))
+        loaded = await NavSnapshotRepository().load_latest_history("000004")
+        assert loaded is not None
+        loaded_records, business_date = loaded
+        assert loaded_records == gz_records
+        assert business_date == date(2026, 9, 9)
         await session_module.get_engine().dispose()
 
     asyncio.run(run())

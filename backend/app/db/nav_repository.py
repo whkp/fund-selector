@@ -23,6 +23,50 @@ def make_id(prefix: str) -> str:
 
 
 class NavSnapshotRepository:
+    async def load_latest_history(self, code: str) -> tuple[list[dict[str, Any]], date] | None:
+        """取该基金最近一次落库的历史净值快照（有 gzip 副本就优先用它）。
+
+        两段式查询：先只取定位列（id / 是否 gz / business_date），再按需读
+        payload 列 —— 直接 ORM 全实体读会把大字段整行拉回，跨洋库上这笔
+        传输纯属浪费（fund-universe 那套已经因此卡死过）。返回
+        (records, business_date)；没有可用快照时返回 None。
+        """
+        async with get_session_factory()() as session:
+            has_gz = RawDataSnapshot.payload_gz.is_not(None)
+            row = (await session.execute(
+                select(RawDataSnapshot.id, has_gz.label("has_gz"), RawDataSnapshot.business_date)
+                .where(RawDataSnapshot.endpoint == f"fund-history:{code}")
+                .order_by(has_gz.desc(), RawDataSnapshot.fetched_at.desc())
+                .limit(1)
+            )).first()
+            if row is None:
+                return None
+            if row.has_gz:
+                payload_bytes = await session.scalar(
+                    select(RawDataSnapshot.payload_gz).where(RawDataSnapshot.id == row.id))
+                if payload_bytes is None:
+                    return None
+                raw_text = gzip.decompress(payload_bytes).decode("utf-8")
+            else:
+                raw_text = await session.scalar(
+                    select(RawDataSnapshot.payload_text).where(RawDataSnapshot.id == row.id))
+                if raw_text is None:
+                    return None
+        try:
+            records = json.loads(raw_text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(records, list) or not records:
+            return None
+        business_date = row.business_date
+        if business_date is None:
+            # 更早版本可能没写 business_date：退回记录里的最后一天（写入侧已排过序）。
+            try:
+                business_date = date.fromisoformat(str(records[-1]["date"]))
+            except (KeyError, TypeError, ValueError):
+                return None
+        return records, business_date
+
     async def persist_history(self, fund: Fund, records: list[dict[str, Any]], *, source_name: str,
                               source_type: str, trust_level: str,
                               parser_version: str = "akshare-history-v1") -> dict[str, Any]:

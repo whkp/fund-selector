@@ -351,6 +351,12 @@ class DataRepository:
         # 最近一次目录落库的后台任务（keep reference：既防被 GC 回收，
         # 也供测试等待它结束）。
         self._persist_task: asyncio.Task | None = None
+        # 按需落库：每只基金一个 in-flight 历史落库任务（key 是基金 code），
+        # 完成回调负责把自己摘掉，keep reference 的理由同 _persist_task。
+        self._history_persist_tasks: dict[str, asyncio.Task] = {}
+        # 历史快照的回收上限（天）：business_date 距今超过这个天数就不再回填，
+        # 宁愿多打一次上游 —— 旧日期数据会遮盖最新净值。
+        self.history_stale_after_days = 4
 
     async def refresh_funds(self) -> bool:
         items = await self.provider.list_funds()
@@ -454,6 +460,12 @@ class DataRepository:
             and (datetime.now(UTC) - fetched_at).total_seconds() < self.history_ttl_seconds
         ):
             return self.histories[cache_key]
+        if period == "1年":
+            # 内存未命中/过期：先试数据库快照（落库只写 1年 窗口，回收也只对
+            # 这个周期生效）。命中就回填缓存直接返回，失败或过期照常打上游。
+            recovered = await self._recover_history(code)
+            if recovered is not None:
+                return recovered
         records = await self.provider.history(code, period)
         if not records and cache_key in self.histories:
             # Keep the last good window and defer the retry instead of caching a failure.
@@ -461,7 +473,69 @@ class DataRepository:
             return self.histories[cache_key]
         self.histories[cache_key] = records
         self._history_fetched_at[cache_key] = datetime.now(UTC)
+        if records and period == "1年":
+            self._schedule_history_persist(code, records)
         return records
+
+    async def _recover_history(self, code: str) -> list[dict[str, Any]] | None:
+        """从数据库快照回填 1年 净值；任何失败都返回 None，调用方照常打上游。"""
+        from .db.nav_repository import NavSnapshotRepository
+
+        try:
+            loaded = await NavSnapshotRepository().load_latest_history(code)
+        except Exception as exc:  # noqa: BLE001 - 回填是尽力而为，坏快照不该拖垮请求
+            logger.warning("历史净值快照回填失败 code=%s：%s", code, exc)
+            return None
+        if loaded is None:
+            return None
+        records, business_date = loaded
+        if (datetime.now(UTC).date() - business_date).days > self.history_stale_after_days:
+            return None
+        cache_key = (code, "1年")
+        self.histories[cache_key] = records
+        self._history_fetched_at[cache_key] = datetime.now(UTC)
+        return records
+
+    def _schedule_history_persist(self, code: str, records: list[dict[str, Any]]) -> None:
+        """把刚拉取到的历史净值落库为快照（后台任务，不阻塞请求）。
+
+        code 不在当前目录里的基金不落库：persist_history 会顺手补一条空壳
+        FundRecord，把目录外的基金钉进数据库。同一只基金已在落库时跳过，
+        避免任务堆积（数据由下次请求兜底）。
+        """
+        if code not in self.funds:
+            return
+        existing = self._history_persist_tasks.get(code)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._persist_history(code, records))
+        self._history_persist_tasks[code] = task
+        task.add_done_callback(lambda finished: self._log_history_persist_result(code, finished))
+
+    def _log_history_persist_result(self, code: str, task: asyncio.Task) -> None:
+        self._history_persist_tasks.pop(code, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning("历史净值快照落库失败 code=%s：%s", code, error)
+
+    async def _persist_history(self, code: str, records: list[dict[str, Any]]) -> None:
+        from .db.nav_repository import NavSnapshotRepository
+
+        fund = self.funds.get(code)
+        if fund is None:
+            return
+        # provider 可能是测试替身：status 字段缺失时用中性默认值，落库是尽力而为。
+        status = getattr(self.provider, "status", None)
+        result = await NavSnapshotRepository().persist_history(
+            fund, records,
+            source_name=getattr(status, "source_name", "unknown"),
+            source_type=getattr(status, "source_type", "AKSHARE_PUBLIC"),
+            trust_level=getattr(status, "trust_level", "LOW"),
+        )
+        logger.info("历史净值快照落库 code=%s status=%s updated=%s",
+                    code, result.get("status"), result.get("updated"))
 
     def list_funds(self) -> list[Fund]:
         return sorted(self.funds.values(), key=lambda item: (-item.score, item.code))
