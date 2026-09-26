@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .config import config_value
 from .models import Fund, SourceStatus
+
+logger = logging.getLogger(__name__)
 
 
 def _positive_int(value: Any, fallback: int) -> int:
@@ -345,6 +348,9 @@ class DataRepository:
         self._funds_fetched_at: datetime | None = None
         self._history_fetched_at: dict[tuple[str, str], datetime] = {}
         self._funds_lock = asyncio.Lock()
+        # 最近一次目录落库的后台任务（keep reference：既防被 GC 回收，
+        # 也供测试等待它结束）。
+        self._persist_task: asyncio.Task | None = None
 
     async def refresh_funds(self) -> bool:
         items = await self.provider.list_funds()
@@ -358,7 +364,57 @@ class DataRepository:
         self.histories.clear()
         self._history_fetched_at.clear()
         self._funds_fetched_at = datetime.now(UTC)
+        self._schedule_universe_persist(items)
         return True
+
+    async def adopt_universe(self, funds: list[Fund], fetched_at: datetime | None = None) -> None:
+        """用数据库快照重建的内存目录替换当前数据集（启动时调用）。
+
+        `fetched_at` 传快照的真实抓取时间，TTL 照常生效 —— 过期时
+        ensure_funds() 会走一次上游刷新，失败也有这份数据兜底。
+        """
+        if not funds:
+            return
+        self.funds = {fund.code: fund for fund in funds}
+        # 索引构建对 2 万只基金要扫几十万次字符串，丢进线程别占事件循环。
+        self._gram_index = await asyncio.to_thread(build_gram_index, funds)
+        if fetched_at is not None and fetched_at.tzinfo is None:
+            # SQLite 等无时区列读回来是 naive datetime，按 UTC 解读。
+            fetched_at = fetched_at.replace(tzinfo=UTC)
+        self._funds_fetched_at = fetched_at or datetime.now(UTC)
+
+    def _schedule_universe_persist(self, funds: list[Fund]) -> None:
+        """把刷新结果落库为快照（后台任务，不阻塞触发刷新的请求）。
+
+        跨洋写 2 万只基金要几十秒，放前台会把请求拖死。失败只记日志：
+        数据仍在内存里可服务，下次刷新或 worker 会再落一次。
+        """
+        if self._persist_task is not None and not self._persist_task.done():
+            # 上一次落库还没结束：跳过，避免任务堆积（数据由下次刷新兜底）。
+            return
+        self._persist_task = asyncio.create_task(self._persist_universe(funds))
+        self._persist_task.add_done_callback(self._log_persist_result)
+
+    @staticmethod
+    def _log_persist_result(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning("基金目录快照落库失败：%s", error)
+
+    async def _persist_universe(self, funds: list[Fund]) -> None:
+        from .db.snapshot_repository import SnapshotRepository
+
+        # provider 可能是测试替身：status 字段缺失时用中性默认值，落库是尽力而为。
+        status = getattr(self.provider, "status", None)
+        result = await SnapshotRepository().persist_fund_universe(
+            funds,
+            source_name=getattr(status, "source_name", "unknown"),
+            source_type=getattr(status, "source_type", "AKSHARE_PUBLIC"),
+            trust_level=getattr(status, "trust_level", "LOW"),
+        )
+        logger.info("基金目录快照落库：status=%s updated=%s", result.get("status"), result.get("updated"))
 
     def relevance_scores(self, query: str) -> dict[str, int]:
         """按问题对全集做相关性打分，返回 code -> 分数（0 分的基金不在结果里）。"""

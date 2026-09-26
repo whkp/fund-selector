@@ -13,7 +13,7 @@ from app.db.base import (
     RawDataSnapshot,
 )
 from app.db.nav_repository import NavSnapshotRepository
-from app.db.snapshot_repository import SnapshotRepository
+from app.db.snapshot_repository import SnapshotRepository, load_fund_universe
 from app.models import Fund
 
 
@@ -61,6 +61,33 @@ def test_persist_fund_universe_writes_snapshot_job_and_outbox(tmp_path, monkeypa
     asyncio.run(run())
 
 
+def test_persist_then_load_fund_universe_roundtrip(tmp_path, monkeypatch):
+    """目录快照写进去 → 装载出来，字段必须逐一还原（启动装载依赖这条路径）。"""
+    db_path = tmp_path / "roundtrip.db"
+    monkeypatch.setenv("FUND_COMPASS_DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    session_module._engine = None
+    session_module._session_factory = None
+
+    async def run():
+        async with session_module.get_engine().begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        # 没有快照时返回 None —— 调用方据此回落到实时抓取。
+        assert await load_fund_universe() is None
+        original = [make_fund("000001"), make_fund("000002")]
+        await SnapshotRepository().persist_fund_universe(
+            original, source_name="AKShare public reference",
+            source_type="AKSHARE_PUBLIC", trust_level="LOW",
+        )
+        loaded = await load_fund_universe()
+        assert loaded is not None
+        funds, fetched_at = loaded
+        assert [f.as_dict() for f in funds] == [f.as_dict() for f in original]
+        assert fetched_at is not None
+        await session_module.get_engine().dispose()
+
+    asyncio.run(run())
+
+
 def test_persist_history_is_idempotent_and_keeps_nav_rows(tmp_path, monkeypatch):
     db_path = tmp_path / "history.db"
     monkeypatch.setenv("FUND_COMPASS_DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
@@ -88,6 +115,10 @@ def test_persist_history_is_idempotent_and_keeps_nav_rows(tmp_path, monkeypatch)
             assert duplicate["status"] == "UNCHANGED"
             assert duplicate["snapshotId"] == first["snapshotId"]
             assert await session.scalar(select(func.count()).select_from(FundNavSnapshot)) == 2
+            # 写入侧只落 gzip 副本，明文列保持空（跨洋读回时快一个量级）。
+            snapshot = await session.scalar(select(RawDataSnapshot))
+            assert snapshot is not None and snapshot.payload_gz is not None
+            assert snapshot.payload_text is None
         await session_module.get_engine().dispose()
 
     asyncio.run(run())

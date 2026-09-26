@@ -47,6 +47,14 @@ class FakeProvider:
         return [] if self.fail else self.history_records
 
 
+async def _drain_persist(repository: DataRepository) -> None:
+    """落库是 refresh_funds 起的后台任务；不等它结束，asyncio.run 关闭
+    event loop 时会留下 "Task was destroyed but it is pending!" 警告。"""
+    task = repository._persist_task
+    if task is not None and not task.done():
+        await task
+
+
 def test_ensure_funds_refetches_after_ttl_expires():
     async def scenario() -> None:
         provider = FakeProvider()
@@ -64,6 +72,7 @@ def test_ensure_funds_refetches_after_ttl_expires():
         repository._funds_fetched_at = datetime.now(UTC) - timedelta(seconds=3601)
         assert await repository.ensure_funds() is True
         assert provider.list_calls == 2
+        await _drain_persist(repository)
 
     asyncio.run(scenario())
 
@@ -84,6 +93,7 @@ def test_ensure_funds_serves_stale_snapshot_when_upstream_fails():
         # 失败后推迟重试，不应每个请求都打上游。
         assert await repository.ensure_funds() is True
         assert provider.list_calls == 2
+        await _drain_persist(repository)
 
     asyncio.run(scenario())
 
@@ -119,5 +129,6 @@ def test_funds_refresh_clears_history_cache():
         await repository.refresh_funds()
         assert repository.histories == {}
         assert repository._history_fetched_at == {}
+        await _drain_persist(repository)
 
     asyncio.run(scenario())

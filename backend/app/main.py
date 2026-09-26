@@ -31,6 +31,13 @@ from .models import Fund
 from .providers import AKShareProvider, DataRepository
 from .security import EmailFormatError, PasswordPolicyError
 
+# 让 app 包的 INFO 日志真正可见：uvicorn 只为自己那两个 logger 配了 handler，
+# 没有这段时 app.* 的 logger.info（warm-up 装载了几只、走没走 DB 快照、
+# 补数回填多少）会因 root 只剩 lastResort(WARNING) 而静默丢失——线上出
+# 问题时无从对账。第三方库保持安静：root 停在 WARNING，只放行 app 包。
+logging.basicConfig(level=logging.WARNING)
+logging.getLogger("app").setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 MODE = str(config_value("app", "mode", "REFERENCE", env_name="FUND_COMPASS_MODE")).upper()
@@ -56,15 +63,27 @@ agent_research = AgentResearchService(llm_service, repository, knowledge_base)
 
 async def _warm_up() -> None:
     """Warm the fund universe so the first request after a cold start is fast."""
+    # 优先从数据库装载上次同步的目录快照：命中且未过 TTL 时连 AKShare 都不用
+    # 打；过期时下面的 ensure_funds() 会做一次刷新，失败也有这份数据兜底。
+    try:
+        from .db.snapshot_repository import load_fund_universe
+
+        snapshot = await load_fund_universe()
+        if snapshot is not None:
+            funds, fetched_at = snapshot
+            await repository.adopt_universe(funds, fetched_at)
+            logger.info("已从数据库装载基金目录 %s 只（快照时间 %s）", len(funds), fetched_at)
+    except Exception as exc:  # noqa: BLE001 - 装载失败只是回落到实时抓取
+        logger.warning("数据库目录快照装载失败：%s", exc)
     try:
         await repository.ensure_funds()
     except Exception as exc:  # noqa: BLE001 - 上游数据源能抛的异常类型无法穷举
         # 预热失败不能挡住启动：第一次请求会再试一次。
         # 但不能静默 —— 冷启动时数据源出问题，这条记录是唯一的线索。
         logger.warning("基金目录预热失败：%s", exc)
-        return
     # 排行接口缺的经理/规模/回撤等字段，之前按需补过并落在 Neon 里；
     # 启动时回填进内存，agent 查这些基金就不用重新打逐只接口。
+    # （内存为空时 load_enriched 自己会跳过。）
     try:
         from .enrichment import load_enriched
 

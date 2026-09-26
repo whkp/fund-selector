@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -49,6 +50,9 @@ class RawDataSnapshot(Base):
     content_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     payload_uri: Mapped[str | None] = mapped_column(String(1000))
     payload_text: Mapped[str | None] = mapped_column(Text)
+    # 全量目录快照用 gzip 压缩后存这里（明文 ~15 MB → ~600 KB）：跨洋库的
+    # 读带宽只有百 KB/s 量级，不解压就传输的明文让「启动装载」慢到不可用。
+    payload_gz: Mapped[bytes | None] = mapped_column(LargeBinary)
     parser_version: Mapped[str] = mapped_column(String(80), nullable=False)
     http_status: Mapped[int | None] = mapped_column(Integer)
     error_code: Mapped[str | None] = mapped_column(String(100))

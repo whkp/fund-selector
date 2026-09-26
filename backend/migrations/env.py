@@ -13,7 +13,11 @@ from app.db.session import database_url
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers 默认是 True：alembic.ini 只声明 root/sqlalchemy/alembic
+    # 三个 logger，fileConfig 会把其余全部已存在的 logger（app.*、uvicorn.*…）
+    # 就地禁用。启动路径会跑 ensure_schema，禁掉之后所有应用日志（预热装载、
+    # 未处理异常、访问日志）全部静默——只能在“服务其实好着”的情况下假装哑巴。
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
