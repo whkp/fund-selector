@@ -6,6 +6,8 @@ manager/company/scale/inception/theme 全是占位值，drawdown/volatility 全�
 数据源（AKShare 雪球逐只接口，实测 161725 通过）：
 - fund_individual_basic_info_xq  → 基金公司/经理/成立时间/最新规模/业绩比较基准
 - fund_individual_achievement_xq → 官方口径各区间最大回撤（近1年等，含同类排名）
+- danjuanfunds.com/djapi/fund    → 风险等级 risk_level（basic_info 底层是同一接口，
+  但它没把该字段抽进返回表，这里直连原始 JSON 取）
 
 策略：
 1. 按需：agent 的 get_fund_detail 命中占位数据时才逐只拉取（每轮研究有预算上限，
@@ -32,6 +34,16 @@ logger = logging.getLogger(__name__)
 PLACEHOLDERS = {"未获取", "未标注", "未知", ""}
 PARSER_VERSION = "akshare-xq-individual-v1"
 
+# 蛋卷接口 risk_level（"1"~"5"）→ 与 main.py RISK_RANK 一致的中文标签。
+RISK_LEVEL_LABELS = {"1": "低风险", "2": "中低风险", "3": "中风险", "4": "中高风险", "5": "高风险"}
+DANJUAN_URL = "https://danjuanfunds.com/djapi/fund/{code}"
+DANJUAN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36"
+    )
+}
+
 # 每轮研究允许补数的基金数上限：补一只要打 2~3 次上游接口。
 ENRICH_BUDGET_PER_RUN = 6
 
@@ -49,6 +61,7 @@ def needs_enrichment(fund: Fund) -> bool:
         or _is_missing(fund.company)
         or fund.scale is None
         or fund.drawdown is None
+        or _is_missing(fund.risk)
     )
 
 
@@ -86,6 +99,48 @@ def _is_na(value: Any) -> bool:
         return bool(value != value)
     except (TypeError, ValueError):
         return True
+
+
+def _inception_years(text: str) -> float | None:
+    """「2015-05-27」→ 成立年数（float）。
+
+    契约与 eligibility() 的 minimumInceptionYears 筛选、前端 `inception: number`
+    一致。这里曾经存的是 date 对象 —— 一旦用户用「成立年限」筛选，
+    `date < int` 的比较会直接抛 TypeError。
+    """
+    try:
+        born = date.fromisoformat(str(text).strip())
+    except ValueError:
+        return None
+    return round((datetime.now(UTC).date() - born).days / 365.25, 2)
+
+
+def risk_label(level: Any) -> str | None:
+    """蛋卷 risk_level 转中文标签；未知值返回 None（保持未获取，不做猜测）。"""
+    if level is None:
+        return None
+    return RISK_LEVEL_LABELS.get(str(level).strip())
+
+
+def _fetch_risk(code: str) -> str | None:
+    """直连蛋卷接口取风险等级。
+
+    akshare 的 fund_individual_basic_info_xq 底层就是同一 URL，但它没有把
+    risk_level 抽进返回表。货币基金等返回空 data 时按「没有数据」处理（None）。
+    同步阻塞，调用方放 to_thread；任何失败都返回 None，不拖垮其他字段的补数。
+    """
+    try:
+        import requests
+
+        response = requests.get(
+            DANJUAN_URL.format(code=code), headers=DANJUAN_HEADERS, timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json().get("data") or {}
+        return risk_label(data.get("risk_level"))
+    except Exception as exc:  # noqa: BLE001 - 补不到只是保持占位值
+        logger.warning("基金 %s 风险等级获取失败：%s", code, str(exc)[:200])
+        return None
 
 
 def _fetch_basic(code: str) -> dict[str, str]:
@@ -146,9 +201,10 @@ async def enrich_fund(repository: Any, code: str) -> dict[str, Any] | None:
 
     loop = asyncio.get_running_loop()
     try:
-        basic, achievement = await asyncio.gather(
+        basic, achievement, risk = await asyncio.gather(
             loop.run_in_executor(None, _fetch_basic, code),
             loop.run_in_executor(None, _fetch_achievement, code),
+            loop.run_in_executor(None, _fetch_risk, code),
         )
     except Exception as exc:  # noqa: BLE001 - 上游接口任何失败都视为「补不到」
         logger.warning("基金 %s 补数失败：%s", code, str(exc)[:200])
@@ -169,9 +225,9 @@ async def enrich_fund(repository: Any, code: str) -> dict[str, Any] | None:
     _apply("manager", basic.get("基金经理") or None)
     _apply("company", basic.get("基金公司") or None)
     _apply("theme", clean_theme(basic.get("业绩比较基准", "")))
+    _apply("risk", risk)
     if fund.inception is None:
-        with contextlib.suppress(KeyError, ValueError):
-            _apply("inception", date.fromisoformat(basic["成立时间"]))
+        _apply("inception", _inception_years(basic.get("成立时间", "")))
     if fund.scale is None:
         _apply("scale", parse_scale(basic.get("最新规模", "")))
     if fund.drawdown is None:
@@ -244,7 +300,7 @@ async def load_enriched(repository: Any) -> int:
     async with get_session_factory()() as session:
         profile_rows = (await session.execute(text(
             "SELECT DISTINCT ON (f.code) f.code, p.company, p.manager, p.scale, p.theme,"
-            " p.subscription_status"
+            " p.subscription_status, p.risk_level"
             " FROM fund_profile_snapshots p JOIN funds f ON f.id = p.fund_id"
             " WHERE p.parser_version = :v"
             " ORDER BY f.code, p.fetched_at DESC",
@@ -274,6 +330,9 @@ async def load_enriched(repository: Any) -> int:
             touched = True
         if _is_missing(fund.theme) and profile["theme"]:
             fund.theme = profile["theme"]
+            touched = True
+        if _is_missing(fund.risk) and profile["risk_level"]:
+            fund.risk = profile["risk_level"]
             touched = True
         if fund.scale is None and profile["scale"] is not None:
             fund.scale = float(profile["scale"])

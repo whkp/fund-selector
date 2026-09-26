@@ -238,8 +238,14 @@ def test_screen_tool_zero_coverage_guard():
 
 
 def test_enrichment_parsers():
-    """补数模块的解析函数：规模/主题/官方回撤。"""
-    from app.enrichment import _official_drawdown, clean_theme, parse_scale
+    """补数模块的解析函数：规模/主题/官方回撤/风险等级/成立年数。"""
+    from app.enrichment import (
+        _inception_years,
+        _official_drawdown,
+        clean_theme,
+        parse_scale,
+        risk_label,
+    )
 
     assert parse_scale("197.40亿") == 197.4
     assert round(parse_scale("5236.81万"), 4) == 0.5237
@@ -250,6 +256,58 @@ def test_enrichment_parsers():
     rows = [{"业绩类型": "阶段业绩", "周期": "近1年", "本产品最大回撒": 38.67}]
     assert _official_drawdown(rows) == -38.67
     assert _official_drawdown([{"业绩类型": "年度业绩", "周期": "近1年", "本产品最大回撒": 1.0}]) is None
+    assert risk_label("4") == "中高风险"
+    assert risk_label(1) == "低风险"
+    assert risk_label("0") is None and risk_label(None) is None and risk_label("未知") is None
+    # 成立年数是 float（eligibility 筛选与前端 `inception: number` 的契约），不是 date 对象。
+    years = _inception_years("2015-05-27")
+    assert years is not None and 10 < years < 14
+    assert _inception_years("") is None and _inception_years("不是日期") is None
+
+
+def test_enrich_fund_applies_risk_level(monkeypatch: pytest.MonkeyPatch):
+    """enrich_fund 把蛋卷风险等级写进内存 Fund；danjuan 失败不拖垮其他字段。"""
+    import asyncio
+
+    import app.enrichment as enrichment
+    from app.enrichment import enrich_fund, needs_enrichment
+
+    fund = reference_fund("161725", 90, risk="未获取")
+    assert needs_enrichment(fund)  # risk 占位本身就要触发补数
+
+    repo = StubRepository({"161725": fund})
+    repo.histories = {}  # enrich_fund 的波动率回退路径要用
+    monkeypatch.setattr(enrichment, "_fetch_basic", lambda code: {
+        "基金经理": "侯昊", "基金公司": "招商基金管理有限公司",
+        "成立时间": "2015-05-27", "最新规模": "197.40亿",
+        "业绩比较基准": "中证白酒指数收益率×95%＋活期存款利率×5%",
+    })
+    monkeypatch.setattr(enrichment, "_fetch_achievement", lambda code: [
+        {"业绩类型": "阶段业绩", "周期": "近1年", "本产品最大回撒": 38.67},
+    ])
+    monkeypatch.setattr(enrichment, "_fetch_risk", lambda code: "中高风险")  # 契约：返回已映射的标签
+
+    async def fake_persist(fund_obj):  # noqa: ARG001 - 测试不碰数据库
+        return None
+
+    monkeypatch.setattr(enrichment, "_persist", fake_persist)
+
+    result = asyncio.run(enrich_fund(repo, "161725"))
+    assert repo.funds["161725"].risk == "中高风险"
+    assert repo.funds["161725"].manager == "侯昊"
+    assert repo.funds["161725"].drawdown == -38.67
+    # inception 必须是「成立年数」（float）—— date 对象会让 eligibility 的
+    # minimumInceptionYears 比较直接抛 TypeError。
+    assert isinstance(repo.funds["161725"].inception, float)
+    assert repo.funds["161725"].inception > 10
+    assert result["updated"]["risk"] == "中高风险"
+
+    # danjuan 不可用时：risk 保持「未获取」，其他字段照常补到
+    repo.funds["004640"] = reference_fund("004640", 80, risk="未获取")
+    monkeypatch.setattr(enrichment, "_fetch_risk", lambda code: None)
+    asyncio.run(enrich_fund(repo, "004640"))
+    assert repo.funds["004640"].risk == "未获取"
+    assert repo.funds["004640"].manager == "侯昊"
 
 
 def test_get_fund_detail_triggers_enrichment_with_budget():

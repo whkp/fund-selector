@@ -17,12 +17,19 @@ FUND_COMPASS_LLM_AGENT_MODE 打开；关闭时行为与旧链路完全一致，�
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from collections.abc import AsyncIterator
 from typing import Any
 
-from tau_agent import AgentHarness, AgentHarnessConfig, MessageEndEvent, ToolExecutionEndEvent, ToolExecutionStartEvent
+from tau_agent import (
+    AgentHarness,
+    AgentHarnessConfig,
+    MessageEndEvent,
+    ToolExecutionEndEvent,
+    ToolExecutionStartEvent,
+)
 from tau_agent.messages import AssistantMessage, TextContent, UserMessage
 from tau_ai import OpenAICompatibleConfig, OpenAICompatibleProvider
 
@@ -220,10 +227,8 @@ class AgentResearchService:
         def _emit(step: dict[str, str]) -> None:
             trace.append(step)
             if on_trace is not None:
-                try:
+                with contextlib.suppress(Exception):  # 展示层故障不能打断研究本身
                     on_trace(step)
-                except Exception:  # noqa: BLE001 - 展示层故障不能打断研究本身
-                    pass
 
         final_stop_reason = "stop"
 
@@ -256,22 +261,25 @@ class AgentResearchService:
                         "detail": detail,
                         "status": "COMPLETED" if not event.is_error else "FAILED",
                     })
-                elif isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage):
-                    if event.message.stop_reason not in {"error", "aborted"}:
-                        final_text = "".join(
-                            block.text for block in event.message.content if isinstance(block, TextContent)
-                        )
-                        final_stop_reason = event.message.stop_reason or "stop"
-                        # 中间轮的自然语言（非 JSON）就是模型的思考过程，透出给前端；
-                        # 最终轮的 JSON 不进轨迹。
-                        text = final_text.strip()
-                        if text and not text.startswith("{") and self._try_parse(text) is None:
-                            _emit({
-                                "event": "thinking",
-                                "title": "模型思考",
-                                "detail": text[:220] + ("…" if len(text) > 220 else ""),
-                                "status": "COMPLETED",
-                            })
+                elif (
+                    isinstance(event, MessageEndEvent)
+                    and isinstance(event.message, AssistantMessage)
+                    and event.message.stop_reason not in {"error", "aborted"}
+                ):
+                    final_text = "".join(
+                        block.text for block in event.message.content if isinstance(block, TextContent)
+                    )
+                    final_stop_reason = event.message.stop_reason or "stop"
+                    # 中间轮的自然语言（非 JSON）就是模型的思考过程，透出给前端；
+                    # 最终轮的 JSON 不进轨迹。
+                    text = final_text.strip()
+                    if text and not text.startswith("{") and self._try_parse(text) is None:
+                        _emit({
+                            "event": "thinking",
+                            "title": "模型思考",
+                            "detail": text[:220] + ("…" if len(text) > 220 else ""),
+                            "status": "COMPLETED",
+                        })
 
         user_message = query + self._format_pool(pool)
         await _consume(harness.prompt(user_message))
