@@ -3,7 +3,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import inspect
+from sqlalchemy import create_engine, inspect, text
 
 import app.db.session as session_module
 from app.db.base import Base
@@ -42,3 +42,24 @@ def test_initial_migration_upgrade_and_downgrade(tmp_path, monkeypatch):
     command.upgrade(config, "head")
     command.downgrade(config, "base")
     assert db_path.exists()
+
+
+def test_holding_migration_upgrades_existing_database(tmp_path, monkeypatch):
+    """旧库必须真正经过 0004 建表，不能仅靠 0001 的最新 metadata 掩盖遗漏。"""
+    db_path = tmp_path / "existing.db"
+    monkeypatch.setenv("FUND_COMPASS_DATABASE_URL", f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "migrations"))
+    command.upgrade(config, "20260926_0003")
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}")
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS fund_holding_snapshots"))
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("fund_holding_snapshots")}
+        assert {"fund_code", "payload_gz", "fetched_at"} <= columns
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "20260927_0004"
+    command.downgrade(config, "20260926_0003")
+    with engine.connect() as connection:
+        assert "fund_holding_snapshots" not in inspect(connection).get_table_names()
+    engine.dispose()

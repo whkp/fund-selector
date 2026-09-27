@@ -5,7 +5,9 @@
 > 并同步更新 `AGENTS.md`。
 > 约定：代码/测试/git 在 WSL Ubuntu-24.04 执行（远程 push 走 Windows 侧）；测试不触网、不用真实密钥。
 
-**当前状态**：阶段一完成 ✅，前端动效升级完成 ✅，阶段二核心完成 ✅（评分引擎 + 前端维度条），当前进行 2.5 预设按钮 + 2.6 验证。
+**当前状态**：阶段二/三首版已实现，自动检查已通过（170 项 pytest、ruff、typecheck、生产 build）；浏览器交互和真实上游任务验收仍待完成。
+
+**验证记录（2026-09-27）**：通过 WSL 调用现有 Windows Python 3.13.14，170 项 pytest 通过；使用 conftest 临时 SQLite，禁用真实上游和模型。包含 ensure_schema、空库迁移升降级、旧库 0003→0004 升降级、worker 重试/跳过/失败状态、调度器暂停启动。ruff、前端 typecheck、生产 build 和 diff 检查通过。2 条警告来自 Starlette/httpx、AnyIO 的弃用提示。未将临时 shim/移出 conftest 的探索测试计入正式结果。
 
 ---
 
@@ -52,7 +54,7 @@
 
 ---
 
-## 阶段二：透明多维评分 + 新手决策引导（当前阶段）
+## 阶段二：透明多维评分 + 新手决策引导 ✅
 
 ### ✅ 2.1 新建 `backend/app/scoring.py` — 多维评分引擎（已完成）
 
@@ -102,19 +104,20 @@ PRESETS = {
 
 ---
 
-### 2.6 阶段二验证
+### 2.6 阶段二验证（自动检查通过，交互验收待完成）
 
-- [ ] `backend/tests/test_scoring.py`（已有 18 个用例）新增：
+- [x] `backend/tests/test_scoring.py`（已有 18 个用例）新增：
   - `build_reason` 含数字的 edge case（`raw="--"` 的基金）
-- [ ] `test_api.py` 新增：
+- [x] `test_api.py` 新增：
   - `/api/funds` 返回的基金 `scoreParts` 非空（至少 1 条有效维度）。
   - `/api/funds/screen?preset=4433` 返回 200 且 items 非空。
   - `/api/funds/screen?preset=不存在` 返回 400。
-- [ ] 前端 `typecheck` 干净；本地启动后手动验证：
+- [x] 前端 `typecheck` 与生产 build 通过。
+- [ ] 浏览器手动验证：
   - 卡片显示真实维度条（非全灰「未获取」短条）。
   - 抽屉进度条有颜色有数字，`null` 维度显示「未获取」。
   - 预设按钮点击后候选列表更新，激活态高亮。
-- [ ] 全量 `pytest` + `ruff` 绿，更新 `AGENTS.md`。
+- [x] 全量 `pytest`（170 passed）+ `ruff` 通过，已更新 `AGENTS.md`。
 
 > **目标**：把卡片上的四条假进度条换成有意义的真实数字，每维度都有数据来源说明。
 
@@ -250,45 +253,49 @@ PRESETS = {
 
 ---
 
-### 2.6 阶段二验证
+### 2.6 阶段二验证（同上方验证记录）
 
-- [ ] `backend/tests/test_scoring.py`（不触网，用 `make_fund` 构造各类基金）：
+- [x] `backend/tests/test_scoring.py`（不触网，用 `make_fund` 构造各类基金）：
   - 各维度归一化边界：最大/最小值映射到 100/0。
   - 缺字段（`one_year=None`）不计入加权分母，总分仍正常。
   - `score_parts` 每项都有 `label`/`value`/`weight`/`color`/`raw`/`basis`。
   - `build_reason` 输出非空、包含至少一条数据数字。
   - 4433 预设返回正确的 `ScreenRequest`。
-- [ ] `test_api.py` 新增：
+- [x] `test_api.py` 新增：
   - `/api/funds` 返回的基金 `scoreParts` 非空（至少有 1 条有效维度）。
   - `/api/funds/screen?preset=4433` 返回 200 且 items 非空。
   - `/api/funds/screen?preset=不存在` 返回 400。
-- [ ] 前端 `typecheck` 干净；本地启动后验证：
+- [x] 前端 `typecheck` 与生产 build 通过。
+- [ ] 本地浏览器交互验收：
   - 卡片显示真实维度条（不全是空条）。
   - 抽屉进度条有颜色有数字。
   - 预设按钮点击后候选列表更新。
-- [ ] 全量 `pytest` + `ruff` 绿，更新 `AGENTS.md`。
+- [x] 全量 `pytest`（170 passed）+ `ruff` 通过。
 
 ---
 
 ## 阶段三：批量补齐关键数据 + 持仓穿透（差异化）
 
-- [ ] **3.1 批量补数 worker** (`backend/app/workers/enrichment.py`)
+- [x] **3.1 批量补数 worker** (`backend/app/workers/enrichment.py`)
   - 对精选集合（浏览前 200 / 关注列表 / 各主题头部 50）批量补 risk/经理/公司/规模/回撤/波动/主题/成立年限，落 Neon。
   - 并发限流（semaphore，默认 3 并发）+ 指数退避重试 + 断点续跑（`fund.needs_enrichment` 为假跳过）。
   - 进度写 `job_runs`；命令 `python -m app.workers.enrichment`；支持 `--limit N` 只跑前 N 只。
-- [ ] **3.2 持仓穿透 / 伪分散检测**
+- [x] **3.2 持仓穿透 / 伪分散检测**
   - `enrichment.py` 增 `_fetch_holdings(code)`：雪球/天天基金前十大重仓股（基金代码 → 重仓列表）。
   - 新表 `fund_holding_snapshots`：alembic 迁移，列 `fund_code`/`fetched_at`/`payload_gz`（只存 gzip，避免跨洋大字段坑）。
   - 补数 worker 写持仓；`watchlist` 页展示持仓重叠预警（两只基金共同重仓 ≥ 5 只时提示）；详情抽屉增「持仓穿透」区块。
-- [ ] **3.3 周期调度**
+- [x] **3.3 周期调度**
   - `workers/scheduler.py` 接 APScheduler（加入 `requirements.txt`）：每日凌晨 2 点增量刷新目录 + 批量补数 + 预填充热门 history。
   - `outbox_events` 加简单后台消费者（写审计日志，为未来事件通知做基础）。
-- [ ] **3.4 数据覆盖度可视化**
+- [x] **3.4 数据覆盖度可视化**
   - `GET /api/data/coverage` 返回 `{total, enriched, holdings, navCached}`。
   - 前端侧边栏「数据状态」卡片增进度条：「已补齐 N 只核心字段 / 持仓覆盖 N 只」。
-- [ ] **3.5 阶段三验证**
-  - `test_enrichment_worker.py`（私有 SQLite + FakeProvider，不触网）：幂等、断点续跑、持仓落库与重叠检测。
-  - 迁移本地 `ensure_schema` 跑通；全量 pytest + ruff 绿；更新 `AGENTS.md`。
+- [x] **3.5 阶段三自动验证**
+  - `test_enrichment_worker.py`：持仓幂等/重叠、私有 SQLite + FakeProvider 的重试/跳过、JobRun 进度和 PARTIAL 状态。
+  - `test_db.py`：空库迁移升降级、旧库 0003→0004 新建持仓表及回滚；conftest 使用应用 `ensure_schema()` 建临时库。
+  - `test_scheduler.py`：暂停启动调度器，确认四个任务注册，绝不实际触发上游任务。
+  - 全量 170 项 pytest、ruff、typecheck、生产 build、diff 检查通过。
+- [ ] **部署与交互验收**：浏览器预设/抽屉/观察页检查，真实数据源补数、服务重启后回填、生产库迁移和调度器常驻运行验证。自动测试不代表这些运行验收已完成。
 
 ---
 

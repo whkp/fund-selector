@@ -31,7 +31,8 @@
 # ⚠️ 局限：本清单保证在目标平台「装得上」，但**未在 Linux 上实跑过**。
 #    每次改动都应重新生成并确认 diff 只含预期变化。
 #
-# 共 62 个包。
+# 共 64 个包。
+apscheduler==3.11.0
 aiosqlite==0.22.1
 akracer==0.0.14
 akshare==1.18.94
@@ -86,6 +87,7 @@ tabulate==0.10.0
 tqdm==4.70.1
 typing-extensions==4.16.0
 typing-inspection==0.4.4
+tzlocal==5.3.1
 tzdata==2026.3
 urllib3==2.7.0
 uvicorn==0.52.4

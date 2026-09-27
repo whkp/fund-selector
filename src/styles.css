@@ -352,6 +352,25 @@ button.avatar:hover { transform: scale(1.06); }
 .small-save { margin-top: 7px; padding: 6px 9px; color: #fff; font-size: 10px; background: linear-gradient(135deg, var(--navy-700), var(--navy-500)); border: 0; border-radius: 6px; transition: filter .16s ease; }
 .small-save:hover { filter: brightness(1.12); }
 .placeholder-module .empty-module { min-height: 440px; }
+.preset-panel { margin: 14px 0 18px; padding: 12px; border: 1px solid var(--line, #dce5f0); border-radius: 12px; background: rgba(246, 249, 253, .8); }
+.preset-title { display: block; margin-bottom: 8px; color: var(--ink-500, #65748a); font-size: 12px; font-weight: 700; }
+.preset-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+.preset-button { border: 1px solid var(--line, #dce5f0); border-radius: 999px; padding: 6px 9px; color: var(--ink-700, #334155); background: #fff; cursor: pointer; font-size: 12px; }
+.preset-button:hover, .preset-button.active { border-color: var(--accent, #5c75e8); color: var(--accent, #5c75e8); background: #eef1ff; }
+.preset-clear { margin-top: 8px; border: 0; color: var(--ink-500, #65748a); background: transparent; cursor: pointer; font-size: 11px; }
+.coverage-card { margin: 22px 4px 0; padding: 12px; border: 1px solid var(--line, #dce5f0); border-radius: 12px; background: rgba(255,255,255,.65); }
+.coverage-heading { display: flex; align-items: center; gap: 6px; color: var(--ink-700, #334155); font-size: 12px; font-weight: 700; }
+.coverage-heading small { margin-left: auto; color: var(--ink-400, #94a3b8); font-size: 10px; font-weight: 500; }
+.coverage-line { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; margin-top: 10px; color: var(--ink-500, #65748a); font-size: 11px; }
+.coverage-line b { color: var(--ink-700, #334155); font-size: 11px; }
+.coverage-line i { grid-column: 1 / -1; display: block; height: 4px; overflow: hidden; border-radius: 4px; background: #e7edf5; }
+.coverage-line em { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #5c75e8, #36a69a); }
+.overlap-warning { display: flex; gap: 9px; margin-bottom: 14px; padding: 12px 14px; border: 1px solid #f1d28d; border-radius: 12px; color: #8b651b; background: #fff9e9; }
+.overlap-warning p { margin: 3px 0 0; font-size: 12px; }
+.drawer-section h3 small { margin-left: 5px; color: var(--ink-400, #94a3b8); font-size: 11px; font-weight: 500; }
+.holding-list { display: grid; gap: 7px; }
+.holding-list div { display: flex; justify-content: space-between; gap: 12px; padding-bottom: 6px; border-bottom: 1px solid var(--line, #dce5f0); color: var(--ink-600, #475569); font-size: 12px; }
+.holding-list b { color: var(--ink-800, #1e293b); }
 
 /* ============ 实时行情 ============ */
 .refresh-market-button:disabled { color: var(--ink-300); cursor: not-allowed; background: transparent; }

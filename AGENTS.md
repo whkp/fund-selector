@@ -33,8 +33,8 @@ fund-selector/
 │   │   │                       #   目录/NAV 落库调度、数据库回收、全集评分重算）
 │   │   ├── scoring.py          # 多维评分引擎（score-v1）：五维度归一化、全集百分位、
 │   │   │                       #   透明降级、build_reason() 一句话结论
-│   │   ├── enrichment.py       # 按需补数：雪球 basic_info/achievement + 蛋卷 risk_level，
-│   │   │                       #   补数后就地重算该只评分
+│   │   ├── enrichment.py       # 按需/批量补数：雪球 basic_info/achievement + 蛋卷 risk_level，
+│   │   │                       #   持仓快照、补数后就地重算该只评分
 │   │   ├── llm.py              # OpenAI-compatible / Ollama 客户端 + 输出校验
 │   │   ├── agent_service.py    # agent 模式研究编排（tau harness 工具循环）
 │   │   ├── agent_tools.py      # agent 工具集（search_funds / get_fund_detail / 净值历史等）
@@ -47,14 +47,14 @@ fund-selector/
 │   │   ├── knowledge.py        # 本地 Markdown 知识库适配器（可换 RAG）
 │   │   ├── watchlist.py        # 观察列表（已持久化到数据库）
 │   │   ├── db/
-│   │   │   ├── base.py         # 全部 ORM 模型（15 张表）
+│   │   │   ├── base.py         # 全部 ORM 模型（16 张表，含持仓快照）
 │   │   │   ├── session.py      # 引擎/会话工厂 + 连接串规范化（asyncpg/sslmode/pooler）
 │   │   │   ├── migrate.py      # ensure_schema()：启动时跑 alembic upgrade head
 │   │   │   ├── snapshot_repository.py  # 目录快照读写（gzip payload）
 │   │   │   └── nav_repository.py       # 历史 NAV 持久化 + load_latest_history 回收
-│   │   └── workers/            # fund_universe（目录同步）/ nav_history（骨架）/ scheduler（单次）
+│   │   └── workers/            # fund_universe / nav_history / enrichment / outbox / scheduler（周期调度）
 │   ├── migrations/             # Alembic；env.py 含日志关键修复（见第 8 节）
-│   ├── tests/                  # 18 个文件、160 项（不触网，见第 5 节）
+│   ├── tests/                  # 后端单元/API/worker 测试（不触网，见第 5 节）
 │   ├── tau_agent/ tau_ai/      # vendored 自 huggingface/tau（MIT，不参与本仓库 lint）
 │   ├── requirements.txt        # 开发用版本区间；部署用 requirements.lock（精确版本）
 │   └── run.py                  # 后端入口：UTF-8 流重配 + dotenv + uvicorn
@@ -129,7 +129,7 @@ cd /mnt/c/Users/hkp/fund-selector/backend
   （`_drain_persist` / `_drain_history_persists`），否则出现 pending task 警告
 - 回收类测试先清表（`_clear_history_snapshots`），保证「未命中」分支确定成立
 - 前端：`npm run typecheck` + `npm run build`
-- CI（`.github/workflows/ci.yml`）：push/PR 跑后端 pytest + ruff，前端 typecheck + build
+- CI（`.github/workflows/ci.yml`）：push/PR 跑后端 pytest + ruff，前端 typecheck + build；本地阶段三新增迁移、持仓快照和 worker 测试需一并覆盖
 
 ## 6. 架构与关键数据流
 
@@ -154,7 +154,7 @@ cd /mnt/c/Users/hkp/fund-selector/backend
 - 落库：刷新成功后 `_schedule_universe_persist` 后台任务写
   `funds` + `fund_profile_snapshots` + `raw_data_snapshots`（endpoint=`fund-universe`，**只存 gzip**）+ `job_runs` + `outbox_events`
 - 去重：同 content_hash 返回 `UNCHANGED`；旧明文快照同内容再落库时就地升级为 gzip（`COMPRESSED`）
-- 手工刷新接口：`POST /api/data/funds/refresh`；worker 单次命令：`python -m app.workers.scheduler`
+- 手工刷新接口：`POST /api/data/funds/refresh`；补数命令：`python -m app.workers.enrichment --limit N`；`python -m app.workers.scheduler` 启动每日调度。
 
 ### 6.3 历史 NAV（按需落库 + 数据库回收）
 
@@ -177,6 +177,10 @@ cd /mnt/c/Users/hkp/fund-selector/backend
   蛋卷 `danjuanfunds.com/djapi/fund/{code}`（risk_level 1~5 → 中文标签）
 - 效果：内存 Fund 直接改 + 重建索引（新经理/主题立即可检索）→ 落
   `fund_profile_snapshots` / `fund_metric_snapshots` → 启动 `load_enriched()` 回填
+- 批量 worker 默认处理浏览前 200、各主题头部 50 和观察列表，最多 3 并发、指数退避、
+  `needs_enrichment()` 跳过内存中已齐字段；JobRun 进度写入串行，部分失败标为 PARTIAL；持仓写入 `fund_holding_snapshots` 的 gzip payload。
+- `GET /api/funds/{code}/holdings` 提供详情穿透，`GET /api/watchlist/overlap` 在共同重仓达到 5 只时告警。
+- `GET /api/data/coverage` 返回目录、核心字段、持仓和 NAV 缓存覆盖度。
 
 ### 6.5 LLM 研究链路
 
@@ -199,14 +203,14 @@ cd /mnt/c/Users/hkp/fund-selector/backend
 - 开发默认 SQLite `backend/data/fund-compass.db`；生产 Neon（连接串**原样粘贴**即可）
 - `db/session.py` 自动规范化：补 `+asyncpg`、`sslmode`→`ssl`、去 `channel_binding`、
   默认关闭 prepared statement cache（Neon `-pooler`/pgbouncer 必需）
-- 15 张表：`funds`、`raw_data_snapshots`、`fund_profile_snapshots`、`fund_nav_snapshots`、
+- 16 张表：`funds`、`raw_data_snapshots`、`fund_profile_snapshots`、`fund_nav_snapshots`、
   `fund_quote_snapshots`、`fund_metric_snapshots`、`job_runs`、`outbox_events`、`users`、
   `conversations`、`conversation_messages`、`risk_profiles`、`watchlist_items`、
-  `recommendation_runs`、`recommendation_steps`
+  `recommendation_runs`、`recommendation_steps`、`fund_holding_snapshots`
 - **结构变更必须写 alembic 迁移**：`Base.metadata.create_all` 只建缺失的表、从不 ALTER
-- 迁移 head（截至 2026-09-27）：`20260926_0003`（raw 快照 gzip 列）
+- 迁移 head（截至 2026-09-27）：`20260927_0004`（持仓 gzip 快照）
 - `recommendation_runs` / `recommendation_steps` 表已建但**暂无代码使用**
-- `outbox_events` 无消费者（写入但无人派发）
+- `outbox_events` 由 scheduler 每 5 分钟消费并写审计日志；暂不发送外部通知
 
 ## 8. 踩坑与硬约定（接手必读）
 
@@ -262,20 +266,20 @@ cd /mnt/c/Users/hkp/fund-selector/backend
 
 ## 10. 已知限制与待办（截至 2026-09-27）
 
-- `workers/scheduler.py` 只执行一次，**无周期调度**（`npm run worker` 同为单次）
-- NAV 仅 `1年` 窗口落库/回收；其余窗口每次回源
-- `workers/nav_history.py` 批量预填充尚未接调度
+- 阶段二/三自动验证已通过：170 项 pytest（2 条第三方弃用警告）、ruff、typecheck、生产 build；包含临时库 ensure_schema、旧库 0003→0004 升降级、worker 重试/跳过/失败进度、调度器暂停启动。浏览器交互、真实上游和生产部署验收仍待完成。
+- `workers/scheduler.py` 已接 APScheduler，每日 02:00 刷新目录、02:20 批量补数、03:00 预填充头部 50 只 NAV；每 5 分钟消费 outbox。APScheduler 3.11.0 / tzlocal 5.3.1 已安装，requirements 和 pyproject 已同步
+- NAV 仅 `1年` 窗口落库/回收；1月/3月/6月从 1年切片，3年仍需回源
+- scheduler 已经通过 Repository.history 接入热门 NAV 预填充；独立 workers/nav_history.py 保留单只同步入口
 - `recommendation_runs` / `recommendation_steps` 表未启用；研究记录目前仅存于对话
-- `outbox_events` 无消费者（写入但无人派发）
+- 持仓只覆盖精选集合，数据源为 AKShare 公开披露，季度披露之间可能过期
 - 前端无路由/Pinia；`dist/` 需手动 `npm run build` 后同步
 - `docs/开发进展.md` 停留在 2026-09-10，晚于它的进展以本文件与 README 为准
+- 阶段三首版新增 `fund_holding_snapshots`（迁移 `20260927_0004`）、批量补数 worker、持仓重叠 API 和覆盖度卡片；持仓来自 AKShare 定期公开披露，不能视为实时持仓
+- 环境阻碍已定位：沙箱隐藏 WSL 互操作套接字时会报 `UtilBindVsockAnyPort`；经工具提权批准后，从 WSL 调用现有 Windows Python 3.13.14 可正常测试，无需重建 venv。不要用 shim 替换依赖或绕开 conftest 来宣称全量测试通过。
+- 当前 node_modules 为 Windows 安装，Linux Vite 缺少原生 Rollup/esbuild 包时，可从 WSL 调用 `node.exe node_modules/vue-tsc/bin/vue-tsc.js -b`，再调用 `node.exe node_modules/vite/bin/vite.js build`（对应 npm run build）；本次已构建 dist。安装依赖的网络错误应按工具规定提权重试。
 - 数据源状态在「仅从 DB 装载、未打上游」时显示 `PENDING`（前端可能提示"等待首个快照"，语义正确但略易困惑）
 - 评分（score-v1）的规模/经理年限维度在 AKShare 目录不提供这两个字段时必须经过雪球补数才能拿到非 null 值；冷启动阶段的基金这两维度会显示「未获取」，补数后自动更新
-- 场景预设按钮（4433/低回撤稳健/科技主题）尚未实现（todo 2.5）
-- `outbox_events` 无消费者
-- 前端无路由/Pinia；`dist/` 需手动 `npm run build` 后同步
-- `docs/开发进展.md` 停留在 2026-09-10，晚于它的进展以本文件与 README 为准
-- 数据源状态在「仅从 DB 装载、未打上游」时显示 `PENDING`（前端可能提示“等待首个快照”，语义正确但略易困惑）
+- 场景预设已提供 `GET /api/funds/screen?preset=...` 与前端按钮，未知 preset 返回 400
 
 ## 11. 文档索引
 

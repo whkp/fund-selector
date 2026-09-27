@@ -9,9 +9,9 @@ import {
 import type { Fund } from './types'
 import {
   addWatchlistItem, createResearchRun, fetchAIStatus, fetchFunds, fetchFundHistory, fetchMarketQuotes, fetchRunTrace,
-  searchFunds,
+  fetchCoverage, fetchFundHoldings, fetchPreset, fetchWatchlistOverlap, searchFunds,
   fetchWatchlist, refreshMarketQuotes, removeWatchlistItem, type MarketQuote, type MarketQuoteResponse,
-  type AIStatus, type FundHistoryResponse, type MarketSourceStatus, type ResearchRun, type RunTrace, type SessionLLMConfig
+  type AIStatus, type Coverage, type FundHistoryResponse, type Holding, type MarketSourceStatus, type ResearchRun, type RunTrace, type SessionLLMConfig
 } from './services/fund-api'
 
 
@@ -38,6 +38,9 @@ const watchlist = ref<Fund[]>([])
 const compareList = ref<Fund[]>([])
 const selectedFund = ref<Fund | null>(null)
 const selectedHistory = ref<FundHistoryResponse | null>(null)
+const selectedHoldings = ref<Holding[]>([])
+const coverage = ref<Coverage | null>(null)
+const overlapWarnings = ref<Array<{ fundCodes: string[]; overlapCount: number; holdingCodes: string[] }>>([])
 const historyLoading = ref(false)
 const traceOpen = ref(false)
 const mobileMenuOpen = ref(false)
@@ -65,6 +68,7 @@ let marketTimer: number | undefined
 const dataLoading = ref(false)
 const dataLoadingMessage = ref('')
 let dataLoadingTimer: number | undefined
+const activePreset = ref('')
 
 // 登录态。authReady 为 false 时先确认令牌，避免闪一下主界面再跳回登录页。
 const authReady = ref(false)
@@ -175,6 +179,7 @@ async function runSearch() {
     return
   }
   isSearching.value = true
+  activePreset.value = ''
   try {
     const hits = await searchFunds(keyword)
     if (searchKeyword.value.trim() !== keyword) return // 关键词已变，丢弃过期结果
@@ -201,11 +206,45 @@ function onSearchInput() {
 function clearSearch() {
   window.clearTimeout(searchTimer)
   searchKeyword.value = ''
-  if (!searchActive.value) return
+  const shouldRestore = searchActive.value || Boolean(activePreset.value)
+  activePreset.value = ''
+  if (!shouldRestore) return
   searchActive.value = false
   // 回到浏览视图（前 200 只）；若之前在看研究结果则一并清掉
   latestRun.value = null
   availableFunds.value = fundUniverse.value
+}
+
+async function applyPreset(name: string) {
+  if (isSearching.value) return
+  isSearching.value = true
+  try {
+    const items = await fetchPreset(name)
+    activePreset.value = name
+    searchActive.value = false
+    searchKeyword.value = ''
+    latestRun.value = null
+    // 预设本身已由服务端执行硬约束；清掉页面的主题/类型二次过滤，避免
+    // 旧的研究条件把预设结果误筛空。
+    fundType.value = '不限'
+    theme.value = '不限主题'
+    if (name === '4433') {
+      maxFee.value = 1.0
+      riskLimit.value = '中高风险'
+    } else if (name === '低回撤稳健') {
+      maxFee.value = 0.8
+      riskLimit.value = '中风险'
+    } else {
+      maxFee.value = 1.2
+      riskLimit.value = '高风险'
+    }
+    availableFunds.value = items
+    notify(items.length ? `已应用「${name}」：找到 ${items.length} 只基金` : `「${name}」暂无符合条件的基金`)
+  } catch {
+    notify('预设筛选失败，请稍后重试')
+  } finally {
+    isSearching.value = false
+  }
 }
 
 /** 数据源给不出风险等级时（候选全部"未获取"），风险上限条件实际不参与筛选，界面要如实说明。 */
@@ -357,6 +396,7 @@ function resetResearch() {
   theme.value = '新能源 / 制造'
   maxFee.value = 1.2
   requireOpen.value = true
+  activePreset.value = ''
   notify('已恢复为本次研究条件')
 }
 
@@ -425,6 +465,7 @@ function clearSessionLLM() {
 async function openFund(fund: Fund) {
   selectedFund.value = fund
   selectedHistory.value = null
+  selectedHoldings.value = []
   if (!apiConnected.value) return
   historyLoading.value = true
   try {
@@ -433,6 +474,11 @@ async function openFund(fund: Fund) {
     selectedHistory.value = null
   } finally {
     historyLoading.value = false
+  }
+  try {
+    selectedHoldings.value = await fetchFundHoldings(fund.code)
+  } catch {
+    selectedHoldings.value = []
   }
 }
 
@@ -498,6 +544,7 @@ function animateScore(target: number) {
 watch(() => selectedFund.value, (fund) => {
   if (fund) animateScore(fund.score)
 })
+function chartLine(fund: Fund | null) {
   if (!fund) return ''
   const points = selectedChart.value
   if (!points.length) return ''
@@ -553,6 +600,12 @@ async function bootstrap() {
     watchlist.value = remoteWatchlist
     aiStatus.value = remoteAIStatus
     apiConnected.value = true
+    try {
+      [coverage.value, overlapWarnings.value] = await Promise.all([fetchCoverage(), fetchWatchlistOverlap()])
+    } catch {
+      coverage.value = null
+      overlapWarnings.value = []
+    }
     if (fundsResult.loading) {
       // 服务端冷启动中：显示骨架屏，每 8s 轮询直到数据就绪
       dataLoading.value = true
@@ -641,6 +694,12 @@ onBeforeUnmount(() => {
           <span v-if="item.label === '我的观察' && watchlist.length" class="nav-count">{{ watchlist.length }}</span>
         </button>
       </nav>
+      <section v-if="coverage" class="coverage-card" aria-label="数据覆盖度">
+        <div class="coverage-heading"><Database :size="15" /><span>数据状态</span><small>{{ coverage.total.toLocaleString() }} 只目录</small></div>
+        <div class="coverage-line"><span>核心字段</span><b>{{ coverage.enriched }}</b><i><em :style="{ width: `${coverage.total ? Math.min(100, coverage.enriched / coverage.total * 100) : 0}%` }"></em></i></div>
+        <div class="coverage-line"><span>持仓覆盖</span><b>{{ coverage.holdings }}</b><i><em :style="{ width: `${coverage.total ? Math.min(100, coverage.holdings / coverage.total * 100) : 0}%` }"></em></i></div>
+        <div class="coverage-line"><span>净值缓存</span><b>{{ coverage.navCached }}</b><i><em :style="{ width: `${coverage.total ? Math.min(100, coverage.navCached / coverage.total * 100) : 0}%` }"></em></i></div>
+      </section>
 
       <div class="sidebar-spacer"></div>
       <div class="data-pulse">
@@ -722,6 +781,13 @@ onBeforeUnmount(() => {
           <div class="research-grid">
             <aside class="filter-panel" aria-label="筛选条件">
               <div class="section-caption"><ListFilter :size="16" /><span>筛选条件</span><button @click="resetResearch">重置</button></div>
+              <div class="preset-panel" aria-label="场景预设">
+                <span class="preset-title">新手场景</span>
+                <div class="preset-buttons">
+                  <button v-for="preset in ['4433', '低回撤稳健', '科技主题']" :key="preset" class="preset-button" :class="{ active: activePreset === preset }" @click="applyPreset(preset)">{{ preset === '4433' ? '📈 ' : preset === '低回撤稳健' ? '🛡️ ' : '💡 ' }}{{ preset }}</button>
+                </div>
+                <button v-if="activePreset" class="preset-clear" @click="clearSearch">清除预设，回到浏览</button>
+              </div>
               <label class="filter-label">基金类型</label>
               <div class="filter-options">
                 <button v-for="option in fundTypeOptions" :key="option.label" :class="{ selected: fundType === option.label }" @click="fundType = option.label">{{ option.label }}<em>{{ option.count }}</em></button>
@@ -858,7 +924,7 @@ onBeforeUnmount(() => {
 
         <section v-else-if="activeNav === '我的观察'" class="module-view">
           <div class="title-row"><div><p class="eyebrow">持续观察</p><h1>为下一次判断留下依据</h1></div><button class="trace-button" @click="activeNav = '基金筛选'"><Plus :size="16" />添加基金</button></div>
-          <div class="watchlist-module"><article v-for="fund in watchlist" :key="fund.id" class="watchlist-card"><div class="watchlist-card-head"><div><span class="mini-avatar large">{{ fund.shortName.slice(0, 1) }}</span><div><h2>{{ fund.shortName }}</h2><p>{{ fund.name }} · {{ fund.code }}</p></div></div><button class="icon-button" title="移出观察" @click="toggleWatch(fund)"><X :size="17" /></button></div><div class="watch-metrics"><span>罗盘适配 <b>{{ fund.score }}</b></span><span>净值日期 <b>{{ fund.navDate }}</b></span><span>数据状态 <b>{{ fund.status }}</b></span></div><div class="watch-note"><label>加入原因与下一次复核</label><textarea v-model="noteDraft" placeholder="例如：与新能源主题候选比较后，再决定是否继续关注。"></textarea><button class="small-save" @click="addNote">保存备注</button></div></article><div v-if="!watchlist.length" class="empty-module"><Star :size="30" /><h2>观察列表还是空的</h2><p>先把值得继续研究的基金加入这里，记录当时的理由。</p><button class="run-button" @click="activeNav = '基金筛选'">开始筛选</button></div></div>
+          <div v-if="overlapWarnings.length" class="overlap-warning"><CircleAlert :size="17" /><div><b>持仓重叠提醒</b><p v-for="warning in overlapWarnings" :key="warning.fundCodes.join('-')">{{ warning.fundCodes.join('、') }} 共同重仓 {{ warning.overlapCount }} 只股票，可能存在伪分散。</p></div></div><div class="watchlist-module"><article v-for="fund in watchlist" :key="fund.id" class="watchlist-card"><div class="watchlist-card-head"><div><span class="mini-avatar large">{{ fund.shortName.slice(0, 1) }}</span><div><h2>{{ fund.shortName }}</h2><p>{{ fund.name }} · {{ fund.code }}</p></div></div><button class="icon-button" title="移出观察" @click="toggleWatch(fund)"><X :size="17" /></button></div><div class="watch-metrics"><span>罗盘适配 <b>{{ fund.score }}</b></span><span>净值日期 <b>{{ fund.navDate }}</b></span><span>数据状态 <b>{{ fund.status }}</b></span></div><div class="watch-note"><label>加入原因与下一次复核</label><textarea v-model="noteDraft" placeholder="例如：与新能源主题候选比较后，再决定是否继续关注。"></textarea><button class="small-save" @click="addNote">保存备注</button></div></article><div v-if="!watchlist.length" class="empty-module"><Star :size="30" /><h2>观察列表还是空的</h2><p>先把值得继续研究的基金加入这里，记录当时的理由。</p><button class="run-button" @click="activeNav = '基金筛选'">开始筛选</button></div></div>
         </section>
 
         <section v-else-if="activeNav === '复盘日志'" class="module-view">
@@ -906,6 +972,7 @@ onBeforeUnmount(() => {
         <div class="chart-panel"><div class="chart-label"><span>单位净值走势</span><small>{{ historyLoading ? '正在读取历史净值...' : selectedHistory?.items.length ? `AKShare · ${selectedHistory.items.length} 个交易日` : 'AKShare 未返回历史净值' }}</small></div><svg v-if="selectedHistory?.items.length" viewBox="0 0 300 104" role="img" aria-label="单位净值走势"><defs><linearGradient id="chartFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#1d6b68" stop-opacity=".22"/><stop offset="100%" stop-color="#1d6b68" stop-opacity="0"/></linearGradient></defs><path :d="chartArea(selectedFund)" fill="url(#chartFill)"/><path :d="chartLine(selectedFund)" fill="none" stroke="#1d6b68" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
         <div class="metric-grid"><div><span>单位净值</span><b>{{ fmtNumber(selectedFund.nav, 4) }}</b><small>{{ selectedFund.navDate || '未获取' }}</small></div><div><span>区间收益</span><b class="positive">{{ fmtPercent(selectedHistory?.metrics?.totalReturn as number | undefined) }}</b><small>{{ selectedHistory?.period ?? '历史数据未获取' }}</small></div><div><span>年化波动</span><b>{{ fmtPercent(selectedHistory?.metrics?.volatility as number | undefined) }}</b><small>{{ selectedHistory?.metricVersion ?? '未计算' }}</small></div><div><span>最大回撤</span><b>{{ fmtPercent(selectedHistory?.metrics?.drawdown as number | undefined) }}</b><small>历史窗口</small></div><div><span>管理费率</span><b>{{ fmtPercent(selectedFund.fee) }}</b><small>AKShare 排行字段</small></div><div><span>数据质量</span><b>{{ selectedHistory?.metricStatus ?? selectedFund.qualityStatus ?? selectedFund.status }}</b><small>{{ selectedHistory?.sourceType ?? selectedFund.navSourceType ?? 'AKSHARE_PUBLIC' }} · {{ selectedHistory?.trustLevel ?? selectedFund.navTrustLevel ?? 'LOW' }}</small></div></div>
         <section class="drawer-section"><h3>研究证据</h3><div class="evidence-list"><div><Check :size="15" /><span>净值与指标：{{ selectedFund.navDate }} · 已通过数据质量检查</span></div><div><Check :size="15" /><span>来源：{{ selectedFund.source }}</span></div><div><CircleAlert :size="15" /><span>{{ selectedFund.caveat }}</span></div></div></section>
+        <section class="drawer-section"><h3>持仓穿透 <small>前十大公开披露</small></h3><div v-if="selectedHoldings.length" class="holding-list"><div v-for="holding in selectedHoldings" :key="holding.code || holding.name"><span>{{ holding.name || holding.code }}</span><b>{{ holding.weight !== null ? `${holding.weight.toFixed(2)}%` : '未获取' }}</b></div></div><p v-else class="source-copy">当前尚无持仓快照，精选补数任务会按公开披露周期补齐。</p></section>
         <section class="drawer-section"><h3>数据口径</h3><p class="source-copy">数据快照 {{ selectedFund.snapshot }}。来源 {{ selectedHistory?.sourceType ?? selectedFund.navSourceType ?? 'AKSHARE_PUBLIC' }}，可信度 {{ selectedHistory?.trustLevel ?? selectedFund.navTrustLevel ?? 'LOW' }}。普通开放式基金仅展示正式披露净值，不将场内行情或第三方估算混为最新净值。</p></section>
         <footer><button class="secondary-action" @click="toggleCompare(selectedFund!)"><ArrowDownUp :size="16" />{{ isComparing(selectedFund) ? '移出对比' : '加入对比' }}</button><button class="run-button" @click="toggleWatch(selectedFund!)"><Star :size="16" :fill="isWatching(selectedFund) ? 'currentColor' : 'none'" />{{ isWatching(selectedFund) ? '已在观察' : '加入观察' }}</button></footer>
       </aside>

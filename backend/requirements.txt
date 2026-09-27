@@ -29,5 +29,6 @@ SQLAlchemy>=2.0,<3
 asyncpg>=0.30,<1
 aiosqlite>=0.20,<1
 alembic>=1.14,<2
+APScheduler>=3.10,<4
 greenlet>=3.0,<4
 pytest>=8,<9

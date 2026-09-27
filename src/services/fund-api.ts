@@ -82,6 +82,9 @@ export type MarketQuoteResponse = {
 type FundListResponse = { items: Fund[]; qualityStatus?: string; message?: string }
 type WatchlistResponse = { items: Array<{ fund: Fund }> }
 
+export type Holding = { code: string; name: string; weight: number | null }
+export type Coverage = { total: number; enriched: number; holdings: number; navCached: number }
+
 export type FundsResult =
   | { loading: true; message: string }
   | { loading: false; funds: Fund[] }
@@ -105,6 +108,16 @@ export async function fetchFunds(): Promise<FundsResult> {
 export async function searchFunds(query: string, limit = 30): Promise<Fund[]> {
   const payload = await request<FundListResponse>(
     `/funds?q=${encodeURIComponent(query)}&limit=${limit}`,
+    undefined,
+    { timeoutMs: TIMEOUT_MS.upstream },
+  )
+  return payload.items
+}
+
+/** 运行服务端命名预设，筛选口径与研究接口保持一致。 */
+export async function fetchPreset(name: string): Promise<Fund[]> {
+  const payload = await request<FundListResponse & { preset?: string }>(
+    `/funds/screen?preset=${encodeURIComponent(name)}`,
     undefined,
     { timeoutMs: TIMEOUT_MS.upstream },
   )
@@ -201,4 +214,18 @@ export async function addWatchlistItem(fund: Fund): Promise<void> {
 
 export async function removeWatchlistItem(fund: Fund): Promise<void> {
   await request(`/watchlist/items/${fund.code}`, { method: 'DELETE' })
+}
+
+export async function fetchFundHoldings(code: string): Promise<Holding[]> {
+  const payload = await request<{ items: Holding[] }>(`/funds/${encodeURIComponent(code)}/holdings`)
+  return payload.items
+}
+
+export async function fetchWatchlistOverlap(): Promise<Array<{ fundCodes: string[]; overlapCount: number; holdingCodes: string[] }>> {
+  const payload = await request<{ items: Array<{ fundCodes: string[]; overlapCount: number; holdingCodes: string[] }> }>('/watchlist/overlap')
+  return payload.items
+}
+
+export async function fetchCoverage(): Promise<Coverage> {
+  return request<Coverage>('/data/coverage')
 }

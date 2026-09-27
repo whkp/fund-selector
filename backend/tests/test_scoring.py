@@ -206,6 +206,14 @@ def test_build_reason_fallback_when_all_null():
     assert "数据待补充" in reason or "公开排行" in reason
 
 
+def test_build_reason_handles_placeholder_raw_without_fake_numbers():
+    fund = make_fund(one_year=None, fee=None, drawdown=None)
+    parts = [{"label": "近1年收益", "value": 72, "weight": 0.3, "color": "#1a3358", "raw": "--", "basis": "测试占位"}]
+    reason = build_reason(fund, parts)
+    assert reason
+    assert "--" not in reason
+
+
 # ---- SCORE_VERSION ----
 
 def test_score_version_string():

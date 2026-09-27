@@ -24,7 +24,7 @@ from .auth import ConversationNotFound, EmailAlreadyRegistered, current_user
 from .config import config_value
 from .db import migrate as migrate_module
 from .db.base import UserRecord
-from .db.session import database_health
+from .db.session import database_health, get_session_factory
 from .knowledge import build_knowledge_base
 from .llm import LLMConfigurationError, LLMError, LLMNotConfigured, LLMResponseError, LLMService
 from .models import Fund
@@ -282,6 +282,24 @@ class ScreenRequest(BaseModel):
     # 前端生成的本次研究 ID：服务端收到后立即建立 RUNNING 占位记录，
     # agent 每完成一步工具调用就把 trace 写进去，前端轮询拿到实时思考过程。
     runId: str = Field(default="", max_length=64)
+
+
+# 预设只描述确定性的硬约束和检索词，最终仍由同一套 eligibility()/filtered()
+# 执行，避免前端自己复制一份筛选语义导致展示与研究请求不一致。
+PRESETS: dict[str, dict[str, Any]] = {
+    "4433": {
+        "query": "4433",
+        "filters": {"maxFee": 1.0, "riskLevelMax": "中高风险"},
+    },
+    "低回撤稳健": {
+        "query": "回撤小 稳健",
+        "filters": {"maxFee": 0.8, "riskLevelMax": "中风险"},
+    },
+    "科技主题": {
+        "query": "科技 半导体 AI",
+        "filters": {"fundTypes": ["股票型"]},
+    },
+}
 
 
 class WatchRequest(BaseModel):
@@ -667,6 +685,39 @@ async def funds(
     return envelope([fund.as_dict() for fund in browse[:BROWSE_LIST_LIMIT]])
 
 
+@app.get("/api/funds/screen")
+async def screen_preset(
+    preset: str = Query(..., min_length=1, max_length=40),
+    user: UserRecord = Depends(current_user),
+) -> dict[str, Any]:
+    """执行一个命名场景预设；未知名称明确报错，避免静默回到默认筛选。"""
+    require_production_data()
+    definition = PRESETS.get(preset)
+    if definition is None:
+        raise HTTPException(status_code=400, detail={
+            "code": "UNKNOWN_PRESET", "message": f"不存在的筛选预设：{preset}",
+        })
+    await repository.ensure_funds()
+    request = ScreenRequest(
+        query=str(definition.get("query", "")),
+        filters=Filters(**dict(definition.get("filters", {}))),
+    )
+    return {**envelope([item.as_dict() for item in filtered(request)]), "preset": preset}
+
+
+@app.get("/api/funds/{code}/holdings")
+async def fund_holdings(code: str, user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+    require_production_data()
+    await repository.ensure_funds()
+    if repository.get_fund(code) is None:
+        raise HTTPException(404, detail={"code": "FUND_NOT_FOUND", "message": "基金不存在"})
+    from .enrichment import load_holdings
+
+    items = await load_holdings(code)
+    return {"fundCode": code, "items": items, "coverageStatus": "ACTIVE" if items else "MISSING",
+            "sourceType": "AKSHARE_PUBLIC", "trustLevel": "LOW"}
+
+
 @app.get("/api/funds/{code}")
 async def fund_detail(code: str, user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     require_production_data()
@@ -971,6 +1022,23 @@ async def data_sources(user: UserRecord = Depends(current_user)) -> dict[str, An
     return {"items": [provider.status.as_dict()], "mode": MODE, "nav": provider.status.as_dict()}
 
 
+@app.get("/api/data/coverage")
+async def data_coverage(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+    """返回精选数据覆盖度，供侧边栏和运维检查使用。"""
+    await repository.ensure_funds()
+    from sqlalchemy import func, select
+
+    from .db.base import FundHoldingSnapshot, FundNavSnapshot
+    async with get_session_factory()() as session:
+        holdings = await session.scalar(select(func.count(func.distinct(FundHoldingSnapshot.fund_code)))) or 0
+        nav_cached = await session.scalar(select(func.count(func.distinct(FundNavSnapshot.fund_id)))) or 0
+    from .enrichment import needs_enrichment
+
+    enriched = sum(1 for fund in repository.funds.values() if not needs_enrichment(fund))
+    return {"total": len(repository.funds), "enriched": enriched, "holdings": int(holdings),
+            "navCached": max(int(nav_cached), len({code for code, _ in repository.histories}))}
+
+
 @app.post("/api/data/funds/refresh")
 async def refresh_funds(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
     require_public_write()
@@ -1000,6 +1068,22 @@ async def add_watch(
 async def remove_watch(code: str, user: UserRecord = Depends(current_user)) -> None:
     if not await watchlist_module.remove_item(user.id, code):
         raise HTTPException(404, detail={"code": "WATCHLIST_ITEM_NOT_FOUND", "message": "观察列表中没有该基金"})
+
+
+@app.get("/api/watchlist/overlap")
+async def watchlist_overlap(user: UserRecord = Depends(current_user)) -> dict[str, Any]:
+    """检查当前用户观察列表的前十大持仓重叠。"""
+    from sqlalchemy import select
+
+    from .db.base import FundRecord, WatchlistItem
+    from .enrichment import holding_overlap
+
+    async with get_session_factory()() as session:
+        codes = (await session.scalars(
+            select(FundRecord.code).join(WatchlistItem, WatchlistItem.fund_id == FundRecord.id)
+            .where(WatchlistItem.user_id == user.id)
+        )).all()
+    return {"items": await holding_overlap(list(codes)), "threshold": 5}
 
 
 @app.get("/api/profile/risk")

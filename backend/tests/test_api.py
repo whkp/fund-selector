@@ -14,14 +14,14 @@ from app.main import app, llm_service, repository
 from app.models import Fund
 
 
-def reference_fund(code: str, score: int, *, risk: str = "中高风险", fee: float | None = 1.2,
+def reference_fund(code: str, score: int, *, risk: str = "中高风险", fee: float | None = 0.8,
                    intake: str = "开放申购") -> Fund:
     return Fund(
         id=f"ak-{code}", code=code, name=f"AKShare 基金 {code}", short_name=f"基金 {code}",
         type="混合型", risk=risk, manager="未获取", manager_years=None, company="未获取",
         theme="未标注", nav=1.0, nav_date="2026-08-11", ytd=10.0, one_year=12.0,
         volatility=None, drawdown=None, fee=fee, scale=None, inception=None, score=score,
-        score_parts=[], reason="按 AKShare 当前公开排行字段排序；未获得的主数据不参与计算。",
+        score_parts=[{"label": "近1年收益", "value": 50, "weight": 0.30, "color": "#1a3358", "raw": "+12.0%", "basis": "测试快照"}], reason="按 AKShare 当前公开排行字段排序；未获得的主数据不参与计算。",
         caveat="主数据待核验。", highlights=["单位净值已获取"], status="待核",
         source="AKShare public reference", snapshot="akshare-test-snapshot", chart=[], tags=["新能源"],
         intake=intake, quality_status="REFERENCE", nav_source_type="AKSHARE_PUBLIC",
@@ -90,6 +90,26 @@ def test_funds_are_compatible_with_vue_contract():
     assert body["items"][0]["navSourceType"] == "AKSHARE_PUBLIC"
     assert body["sourceType"] == "AKSHARE_PUBLIC"
     assert body["qualityStatus"] == "REFERENCE"
+    assert any(part["value"] is not None for part in body["items"][0]["scoreParts"])
+
+
+def test_screen_preset_4433_returns_items():
+    response = client.get("/api/funds/screen", params={"preset": "4433"}, headers=register_user())
+    assert response.status_code == 200
+    assert response.json()["preset"] == "4433"
+    assert response.json()["items"]
+
+
+def test_screen_preset_rejects_unknown_name():
+    response = client.get("/api/funds/screen", params={"preset": "不存在"}, headers=register_user())
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "UNKNOWN_PRESET"
+
+
+def test_data_coverage_returns_stage_three_fields():
+    response = client.get("/api/data/coverage", headers=register_user())
+    assert response.status_code == 200
+    assert set(response.json()) == {"total", "enriched", "holdings", "navCached"}
 
 
 def test_screen_preserves_unknown_fields_for_reference_research():

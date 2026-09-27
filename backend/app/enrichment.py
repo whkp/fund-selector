@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gzip
+import hashlib
+import json
 import logging
 import re
 from datetime import UTC, date, datetime
@@ -46,6 +49,7 @@ DANJUAN_HEADERS = {
 
 # 每轮研究允许补数的基金数上限：补一只要打 2~3 次上游接口。
 ENRICH_BUDGET_PER_RUN = 6
+HOLDING_PARSER_VERSION = "akshare-holdings-v1"
 
 
 def _is_missing(value: Any) -> bool:
@@ -63,6 +67,123 @@ def needs_enrichment(fund: Fund) -> bool:
         or fund.drawdown is None
         or _is_missing(fund.risk)
     )
+
+
+def _first_column(columns: list[str], *names: str) -> str | None:
+    for name in names:
+        if name in columns:
+            return name
+    return None
+
+
+def _fetch_holdings(code: str) -> list[dict[str, Any]]:
+    """取最近可用年度的前十大股票持仓，统一成稳定的小 JSON 结构。"""
+    import akshare as ak
+
+    current_year = datetime.now(UTC).year
+    frame = None
+    for year in (current_year, current_year - 1, current_year - 2):
+        try:
+            frame = ak.fund_portfolio_hold_em(symbol=code, date=str(year))
+            if frame is not None and not frame.empty:
+                break
+        except Exception:  # noqa: BLE001 - 换用上一披露年度
+            frame = None
+    if frame is None or frame.empty:
+        return []
+    columns = [str(column) for column in frame.columns]
+    code_col = _first_column(columns, "股票代码", "证券代码", "代码")
+    name_col = _first_column(columns, "股票名称", "证券名称", "名称")
+    weight_col = _first_column(columns, "占净值比例", "占净值比", "持仓占比")
+    result: list[dict[str, Any]] = []
+    for row in frame.to_dict("records"):
+        holding_code = str(row.get(code_col, "")).strip() if code_col else ""
+        holding_name = str(row.get(name_col, "")).strip() if name_col else ""
+        if not holding_code and not holding_name:
+            continue
+        weight: float | None = None
+        if weight_col:
+            raw = str(row.get(weight_col, "")).replace("%", "").strip()
+            try:
+                weight = float(raw)
+            except (TypeError, ValueError):
+                weight = None
+        result.append({"code": holding_code, "name": holding_name, "weight": weight})
+        if len(result) >= 10:
+            break
+    return result
+
+
+async def persist_holdings(code: str, holdings: list[dict[str, Any]], *, source_type: str = "AKSHARE_PUBLIC",
+                           trust_level: str = "LOW") -> dict[str, Any]:
+    """幂等写入一份 gzip 持仓快照。"""
+    if not holdings:
+        return {"updated": 0, "status": "EMPTY", "fundCode": code}
+    from sqlalchemy import select
+
+    from .db.base import FundHoldingSnapshot
+    from .db.session import get_session_factory
+    from .db.snapshot_repository import make_id
+
+    raw_text = json.dumps(holdings, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+    now = datetime.now(UTC)
+    async with get_session_factory()() as session:
+        existing = await session.scalar(select(FundHoldingSnapshot.id).where(
+            FundHoldingSnapshot.fund_code == code,
+            FundHoldingSnapshot.content_hash == content_hash,
+            FundHoldingSnapshot.parser_version == HOLDING_PARSER_VERSION,
+        ))
+        if existing is not None:
+            return {"updated": 0, "status": "UNCHANGED", "snapshotId": existing, "fundCode": code}
+        snapshot_id = make_id("holding")
+        session.add(FundHoldingSnapshot(
+            id=snapshot_id, fund_code=code, fetched_at=now, business_date=now.date(),
+            payload_gz=gzip.compress(raw_text.encode("utf-8")), content_hash=content_hash,
+            source_type=source_type, trust_level=trust_level, parser_version=HOLDING_PARSER_VERSION,
+        ))
+        await session.commit()
+    return {"updated": len(holdings), "status": "COMPLETED", "snapshotId": snapshot_id, "fundCode": code}
+
+
+async def load_holdings(code: str) -> list[dict[str, Any]]:
+    """只读定位列后按需解压 payload，避免 ORM 把大字段整行拉回。"""
+    from sqlalchemy import select
+
+    from .db.base import FundHoldingSnapshot
+    from .db.session import get_session_factory
+
+    async with get_session_factory()() as session:
+        snapshot_id = await session.scalar(select(FundHoldingSnapshot.id).where(
+            FundHoldingSnapshot.fund_code == code,
+        ).order_by(FundHoldingSnapshot.fetched_at.desc()).limit(1))
+        if snapshot_id is None:
+            return []
+        payload = await session.scalar(select(FundHoldingSnapshot.payload_gz).where(
+            FundHoldingSnapshot.id == snapshot_id,
+        ))
+    if payload is None:
+        return []
+    try:
+        value = json.loads(gzip.decompress(payload).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+async def holding_overlap(codes: list[str], *, threshold: int = 5) -> list[dict[str, Any]]:
+    """计算观察列表基金的共同重仓股票，达到阈值才返回预警。"""
+    holdings_by_fund = {code: await load_holdings(code) for code in codes}
+    warnings: list[dict[str, Any]] = []
+    for index, left in enumerate(codes):
+        left_codes = {str(item.get("code") or item.get("name")) for item in holdings_by_fund.get(left, [])}
+        left_codes.discard("")
+        for right in codes[index + 1:]:
+            right_codes = {str(item.get("code") or item.get("name")) for item in holdings_by_fund.get(right, [])}
+            overlap = sorted(left_codes & right_codes)
+            if len(overlap) >= threshold:
+                warnings.append({"fundCodes": [left, right], "overlapCount": len(overlap), "holdingCodes": overlap})
+    return warnings
 
 
 def parse_scale(text: str) -> float | None:

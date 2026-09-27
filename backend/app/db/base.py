@@ -58,6 +58,27 @@ class RawDataSnapshot(Base):
     error_code: Mapped[str | None] = mapped_column(String(100))
 
 
+class FundHoldingSnapshot(Base):
+    """基金定期披露的前十大股票持仓（公开参考数据）。
+
+    持仓 payload 只保留 gzip，避免跨洋数据库读路径把大块明文拖回进程。
+    ``fund_code`` 故意按代码保存：目录快照刷新时基金行可能被替换，但持仓
+    仍可按公开代码追溯；解析器版本用于以后更换上游时并存新旧口径。
+    """
+
+    __tablename__ = "fund_holding_snapshots"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    fund_code: Mapped[str] = mapped_column(String(16), index=True, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    business_date: Mapped[date | None] = mapped_column(Date)
+    payload_gz: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    trust_level: Mapped[str] = mapped_column(String(30), nullable=False)
+    parser_version: Mapped[str] = mapped_column(String(80), nullable=False)
+
+
 class FundProfileSnapshot(Base):
     __tablename__ = "fund_profile_snapshots"
 
