@@ -63,24 +63,30 @@ agent_research = AgentResearchService(llm_service, repository, knowledge_base)
 
 async def _warm_up() -> None:
     """Warm the fund universe so the first request after a cold start is fast."""
-    # 优先从数据库装载上次同步的目录快照：命中且未过 TTL 时连 AKShare 都不用
-    # 打；过期时下面的 ensure_funds() 会做一次刷新，失败也有这份数据兜底。
+    # 装载期间置 loading：并发的冷启动请求会等装载完成，而不是抢先各自去打全量上游。
+    repository.loading = True
     try:
-        from .db.snapshot_repository import load_fund_universe
+        # 优先从数据库装载上次同步的目录快照：命中且未过 TTL 时连 AKShare 都不用
+        # 打；过期时下面的 ensure_funds() 会做一次刷新，失败也有这份数据兜底。
+        try:
+            from .db.snapshot_repository import load_fund_universe
 
-        snapshot = await load_fund_universe()
-        if snapshot is not None:
-            funds, fetched_at = snapshot
-            await repository.adopt_universe(funds, fetched_at)
-            logger.info("已从数据库装载基金目录 %s 只（快照时间 %s）", len(funds), fetched_at)
-    except Exception as exc:  # noqa: BLE001 - 装载失败只是回落到实时抓取
-        logger.warning("数据库目录快照装载失败：%s", exc)
-    try:
-        await repository.ensure_funds()
-    except Exception as exc:  # noqa: BLE001 - 上游数据源能抛的异常类型无法穷举
-        # 预热失败不能挡住启动：第一次请求会再试一次。
-        # 但不能静默 —— 冷启动时数据源出问题，这条记录是唯一的线索。
-        logger.warning("基金目录预热失败：%s", exc)
+            snapshot = await load_fund_universe()
+            if snapshot is not None:
+                funds, fetched_at = snapshot
+                await repository.adopt_universe(funds, fetched_at)
+                logger.info("已从数据库装载基金目录 %s 只（快照时间 %s）", len(funds), fetched_at)
+        except Exception as exc:  # noqa: BLE001 - 装载失败只是回落到实时抓取
+            logger.warning("数据库目录快照装载失败：%s", exc)
+        try:
+            await repository.ensure_funds()
+        except Exception as exc:  # noqa: BLE001 - 上游数据源能抛的异常类型无法穷举
+            # 预热失败不能挡住启动：第一次请求会再试一次。
+            # 但不能静默 —— 冷启动时数据源出问题，这条记录是唯一的线索。
+            logger.warning("基金目录预热失败：%s", exc)
+    finally:
+        # 无论成败都放行等待中的请求：装载失败时让请求回落到实时抓取，不会死等。
+        repository.mark_loaded()
     # 排行接口缺的经理/规模/回撤等字段，之前按需补过并落在 Neon 里；
     # 启动时回填进内存，agent 查这些基金就不用重新打逐只接口。
     # （内存为空时 load_enriched 自己会跳过。）
@@ -630,6 +636,14 @@ async def funds(
 ) -> dict[str, Any]:
     require_production_data()
     await repository.ensure_funds()
+    # 冷启动装载中（内存仍空）：返回 LOADING 质量状态让前端显示骨架屏，
+    # 而不是一个空列表——空列表无法与「真的没有数据」区分。
+    if not repository.is_ready():
+        return {
+            **envelope([]),
+            "qualityStatus": "LOADING",
+            "message": "基金数据装载中，通常需要 1～2 分钟，请稍候…",
+        }
     if q.strip():
         # 按名称/代码搜索：走全量 n-gram 相关性索引（与研究问答同一套打分），
         # 浏览列表只有前 200 只，深层的基金只能靠这里召回。

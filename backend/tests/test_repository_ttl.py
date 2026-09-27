@@ -79,6 +79,13 @@ async def _clear_history_snapshots() -> None:
     await session_module.get_engine().dispose()
 
 
+async def _drain_refresh(repository: DataRepository) -> None:
+    """stale-while-revalidate 的后台刷新任务；不等它结束会留 pending task 警告。"""
+    task = repository._refresh_task
+    if task is not None and not task.done():
+        await task
+
+
 def test_ensure_funds_refetches_after_ttl_expires():
     async def scenario() -> None:
         provider = FakeProvider()
@@ -92,9 +99,11 @@ def test_ensure_funds_refetches_after_ttl_expires():
         assert await repository.ensure_funds() is True
         assert provider.list_calls == 1
 
-        # 过期后必须重新拉取。
+        # 过期但有旧数据：立即返回旧快照，后台单飞刷新（stale-while-revalidate）。
         repository._funds_fetched_at = datetime.now(UTC) - timedelta(seconds=3601)
         assert await repository.ensure_funds() is True
+        # 请求立即返回，但后台刷新任务已启动，等它跑完后调用计数应为 2。
+        await _drain_refresh(repository)
         assert provider.list_calls == 2
         await _drain_persist(repository)
 
@@ -110,13 +119,15 @@ def test_ensure_funds_serves_stale_snapshot_when_upstream_fails():
 
         provider.fail = True
         repository._funds_fetched_at = datetime.now(UTC) - timedelta(seconds=100_000)
+        # 过期但有旧数据：stale-while-revalidate — 立即返回旧快照，后台刷新（会失败）。
         assert await repository.ensure_funds() is True
-        assert provider.list_calls == 2
-        # 上游失败时旧快照仍可服务。
+        await _drain_refresh(repository)
+        # 上游失败时旧快照仍可服务，后台刷新做了一次尝试。
         assert len(repository.list_funds()) == 1
-        # 失败后推迟重试，不应每个请求都打上游。
-        assert await repository.ensure_funds() is True
         assert provider.list_calls == 2
+        # 后台刷新失败后 _refresh_task 已标记为 done；再次调用 ensure_funds
+        # 时 TTL 仍过期，会再次触发后台刷新。此处验证旧数据仍可用。
+        assert await repository.ensure_funds() is True
         await _drain_persist(repository)
 
     asyncio.run(scenario())

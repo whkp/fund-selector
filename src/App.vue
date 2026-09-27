@@ -13,6 +13,8 @@ import {
   fetchWatchlist, refreshMarketQuotes, removeWatchlistItem, type MarketQuote, type MarketQuoteResponse,
   type AIStatus, type FundHistoryResponse, type MarketSourceStatus, type ResearchRun, type RunTrace, type SessionLLMConfig
 } from './services/fund-api'
+
+
 import LoginView from './views/LoginView.vue'
 import {
   deleteConversation, fetchConversation, fetchConversations, fetchMe,
@@ -59,6 +61,10 @@ const marketDisclaimer = ref('场内交易价格仅作 ETF/LOF 行情参考，�
 const isMarketRefreshing = ref(false)
 const isMarketLoading = ref(false)
 let marketTimer: number | undefined
+// 冷启动骨架屏：服务端返回 LOADING 时显示骨架卡片，轮询直到数据就绪
+const dataLoading = ref(false)
+const dataLoadingMessage = ref('')
+let dataLoadingTimer: number | undefined
 
 // 登录态。authReady 为 false 时先确认令牌，避免闪一下主界面再跳回登录页。
 const authReady = ref(false)
@@ -508,19 +514,51 @@ async function refreshLiveMarket() {
   }
 }
 
+function stopDataLoadingPoll() {
+  if (dataLoadingTimer !== undefined) {
+    window.clearInterval(dataLoadingTimer)
+    dataLoadingTimer = undefined
+  }
+}
+
 async function bootstrap() {
   try {
-    const [remoteFunds, remoteWatchlist, remoteAIStatus] = await Promise.all([fetchFunds(), fetchWatchlist(), fetchAIStatus()])
-    availableFunds.value = remoteFunds
-    fundUniverse.value = remoteFunds
+    const [fundsResult, remoteWatchlist, remoteAIStatus] = await Promise.all([fetchFunds(), fetchWatchlist(), fetchAIStatus()])
     watchlist.value = remoteWatchlist
     aiStatus.value = remoteAIStatus
     apiConnected.value = true
-    loadError.value = remoteFunds.length ? '' : 'AKShare 当前未返回可展示的基金数据。请检查数据源状态后刷新。'
+    if (fundsResult.loading) {
+      // 服务端冷启动中：显示骨架屏，每 8s 轮询直到数据就绪
+      dataLoading.value = true
+      dataLoadingMessage.value = fundsResult.message
+      loadError.value = ''
+      availableFunds.value = []
+      fundUniverse.value = []
+      stopDataLoadingPoll()
+      dataLoadingTimer = window.setInterval(async () => {
+        try {
+          const result = await fetchFunds()
+          if (!result.loading) {
+            stopDataLoadingPoll()
+            dataLoading.value = false
+            dataLoadingMessage.value = ''
+            availableFunds.value = result.funds
+            fundUniverse.value = result.funds
+            loadError.value = result.funds.length ? '' : 'AKShare 当前未返回可展示的基金数据。'
+          }
+        } catch { /* 网络抖动静默，下一轮再试 */ }
+      }, 8000)
+    } else {
+      dataLoading.value = false
+      availableFunds.value = fundsResult.funds
+      fundUniverse.value = fundsResult.funds
+      loadError.value = fundsResult.funds.length ? '' : 'AKShare 当前未返回可展示的基金数据。请检查数据源状态后刷新。'
+    }
     await loadMarketQuotes()
     await loadConversations()
   } catch {
     apiConnected.value = false
+    dataLoading.value = false
     loadError.value = '无法连接基金数据服务。请启动 FastAPI 并确认 AKShare 数据源可用。'
   }
 }
@@ -548,6 +586,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (marketTimer !== undefined) window.clearInterval(marketTimer)
+  stopDataLoadingPoll()
   window.clearTimeout(searchTimer)
   stopTracePolling()
 })
@@ -692,15 +731,37 @@ onBeforeUnmount(() => {
                   <span v-if="isSearching" class="search-spinner"></span>
                 </div>
               </div>
-              <article v-for="(fund, index) in displayedFunds" :key="fund.id" class="fund-card" :class="{ 'fund-warning': fund.status === '注意' }">
-                <div class="rank-col"><span class="rank">0{{ index + 1 }}</span><span v-if="index === 0" class="rank-note">优先研究</span></div>
+              <!-- 冷启动骨架屏：数据装载中时显示占位卡片 -->
+              <div v-if="dataLoading" class="skeleton-container" aria-busy="true" aria-label="数据装载中">
+                <div class="skeleton-banner">
+                  <Loader2 :size="17" class="step-spin" />
+                  <span>{{ dataLoadingMessage || '基金数据装载中，通常需要 1～2 分钟…' }}</span>
+                </div>
+                <div v-for="n in 6" :key="n" class="fund-card skeleton-card">
+                  <div class="rank-col"><div class="skel skel-rank"></div></div>
+                  <div class="fund-main">
+                    <div class="fund-title-line"><div class="skel skel-title"></div><div class="skel skel-tag"></div></div>
+                    <div class="skel skel-name"></div>
+                    <div class="skel skel-reason"></div>
+                    <div class="skel skel-meta"></div>
+                  </div>
+                  <div class="fund-stats">
+                    <div><div class="skel skel-stat-label"></div><div class="skel skel-stat-val"></div></div>
+                    <div><div class="skel skel-stat-label"></div><div class="skel skel-stat-val"></div></div>
+                  </div>
+                  <div class="fund-score"><div class="skel skel-score"></div></div>
+                </div>
+              </div>
+
+              <article v-else v-for="(fund, index) in displayedFunds" :key="fund.id" class="fund-card" :class="{ 'fund-warning': fund.status === '注意' }">
+                <div class="rank-col"><span class="rank">{{ String(index + 1).padStart(2, '0') }}</span><span v-if="index === 0" class="rank-note">优先研究</span></div>
                 <div class="fund-main">
                   <div class="fund-title-line"><h3>{{ fund.shortName }}</h3><span class="type-tag">{{ fund.type }}</span><span class="quality-tag" :class="fund.status">{{ fund.status }}</span></div>
                   <p class="fund-name">{{ fund.name }} <span>{{ fund.code }}</span></p>
                   <p class="fund-reason">{{ fund.reason }}</p>
                   <div class="fund-metadata"><span><Clock3 :size="13" />净值 {{ fund.navDate }}</span><span><Landmark :size="13" />{{ fund.company }}</span><span><Check :size="13" />{{ fund.intake }}</span></div>
                 </div>
-                <div class="fund-stats"><div><span>近 1 年</span><strong :class="{ positive: typeof fund.oneYear === 'number' && fund.oneYear > 0 }">{{ fmtPercent(fund.oneYear) }}</strong></div><div><span>最大回撤</span><strong>{{ fmtPercent(fund.drawdown) }}</strong></div></div>
+                <div class="fund-stats"><div><span>近 1 年</span><strong :class="{ positive: typeof fund.oneYear === 'number' && fund.oneYear > 0, negative: typeof fund.oneYear === 'number' && fund.oneYear < 0 }">{{ fmtPercent(fund.oneYear) }}</strong></div><div><span>最大回撤</span><strong class="negative">{{ fmtPercent(fund.drawdown) }}</strong></div></div>
                 <div class="fund-score"><span>参考排序</span><strong>{{ fund.score }}</strong><i>/100</i></div>
                 <div class="card-actions"><button class="icon-button" :class="{ active: isWatching(fund) }" :title="isWatching(fund) ? '移出观察' : '加入观察'" @click="toggleWatch(fund)"><Star :size="17" :fill="isWatching(fund) ? 'currentColor' : 'none'" /></button><button class="icon-button" :class="{ active: isComparing(fund) }" :title="isComparing(fund) ? '移出对比' : '加入对比'" @click="toggleCompare(fund)"><ArrowDownUp :size="17" /></button><button class="detail-button" @click="openFund(fund)">查看详情 <ChevronRight :size="15" /></button></div>
               </article>

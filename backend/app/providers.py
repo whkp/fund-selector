@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,10 @@ from .config import config_value
 from .models import Fund, SourceStatus
 
 logger = logging.getLogger(__name__)
+
+# 1月/3月/6月 都是「1年」日频序列的子集：可由 1年 序列按天数切片派生，
+# 不必为每个短窗口各打一次 AKShare（跨洋 5~9s）。3年/5年 超出 1年 仍需回源。
+_SHORT_WINDOWS = frozenset({"1月", "3月", "6月"})
 
 
 def _positive_int(value: Any, fallback: int) -> int:
@@ -351,6 +356,16 @@ class DataRepository:
         # 最近一次目录落库的后台任务（keep reference：既防被 GC 回收，
         # 也供测试等待它结束）。
         self._persist_task: asyncio.Task | None = None
+        # TTL 过期后的后台「单飞」刷新任务：过期请求立即拿旧数据返回，刷新在
+        # 后台跑，避免每 6h 有一次用户可见的阻塞卡顿（keep reference 同上）。
+        self._refresh_task: asyncio.Task | None = None
+        # 冷启动装载状态：warm-up 从数据库/上游装载目录期间为 True。此时内存为空
+        # 的请求应等装载完成，而不是抢先各自去打全量上游。
+        self.loading = False
+        self._loaded_event = asyncio.Event()
+        # 冷启动请求等待装载完成的上限（秒）：跨洋装载实测 60~70s，给足余量；
+        # 超时后仍为空则回落到实时抓取，不会永久挂起。
+        self._load_wait_seconds = 90.0
         # 按需落库：每只基金一个 in-flight 历史落库任务（key 是基金 code），
         # 完成回调负责把自己摘掉，keep reference 的理由同 _persist_task。
         self._history_persist_tasks: dict[str, asyncio.Task] = {}
@@ -432,24 +447,67 @@ class DataRepository:
         age = (datetime.now(UTC) - self._funds_fetched_at).total_seconds()
         return age < self.funds_ttl_seconds
 
+    def mark_loaded(self) -> None:
+        """warm-up 完成目录装载后调用：放行等待中的冷启动请求。"""
+        self.loading = False
+        self._loaded_event.set()
+
+    def is_ready(self) -> bool:
+        """目录是否已可服务（内存非空）。未就绪时路由返回 LOADING 状态。"""
+        return bool(self.funds)
+
+    def _schedule_funds_refresh(self) -> None:
+        """TTL 过期时在后台单飞刷新目录，不阻塞触发它的请求。
+
+        已有一个刷新在跑就跳过，避免并发请求堆出一排重复的全量抓取。
+        """
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return
+        self._refresh_task = asyncio.create_task(self._refresh_funds_guarded())
+        self._refresh_task.add_done_callback(self._log_refresh_result)
+
+    async def _refresh_funds_guarded(self) -> None:
+        async with self._funds_lock:
+            # 拿到锁时可能已被前一个刷新刷成新鲜，别重复打上游。
+            if self._funds_are_fresh():
+                return
+            await self.refresh_funds()
+
+    @staticmethod
+    def _log_refresh_result(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning("后台基金目录刷新失败：%s", error)
+
     async def ensure_funds(self) -> bool:
         """Serve the cached universe while fresh, refetch once it expires.
 
-        Concurrent callers share a single upstream refresh. When the upstream
-        fails but a previous snapshot exists, the stale snapshot is served and the
-        retry is deferred to the next TTL window instead of hammering the source.
+        过期但内存仍有旧数据时：**立即返回旧数据**，后台单飞刷新，不再阻塞请求
+        （旧行为是让第一个请求同步重抓 2 万行，并发请求全堵在锁上）。
+        内存完全为空（冷启动未装载）时：若 warm-up 正在装载则等它完成（带超时），
+        否则阻塞共享一次上游刷新。
         """
         if self._funds_are_fresh():
             return True
+        if self.funds:
+            # 过期但有旧数据：先服务旧的，刷新丢给后台。
+            self._schedule_funds_refresh()
+            return True
+        if self.loading:
+            # 冷启动装载中：等装载完成，而不是抢先各自去打全量上游。
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._loaded_event.wait(), timeout=self._load_wait_seconds)
+            if self.funds:
+                return True
         async with self._funds_lock:
             if self._funds_are_fresh():
                 return True
-            if await self.refresh_funds():
-                return True
             if self.funds:
-                self._funds_fetched_at = datetime.now(UTC)
+                self._schedule_funds_refresh()
                 return True
-            return False
+            return bool(await self.refresh_funds())
 
     async def history(self, code: str, period: str) -> list[dict[str, Any]]:
         cache_key = (code, period)
@@ -460,6 +518,16 @@ class DataRepository:
             and (datetime.now(UTC) - fetched_at).total_seconds() < self.history_ttl_seconds
         ):
             return self.histories[cache_key]
+        if period in _SHORT_WINDOWS:
+            # 1月/3月/6月 都是 1年 序列的子集：先拿 1年（缓存/DB 回收/上游），
+            # 再按天数切片派生，避免为每个短窗口各打一次上游。
+            base = await self.history(code, "1年")
+            sliced = self.provider._limit_history_period(base, period) if base else []
+            if sliced:
+                self.histories[cache_key] = sliced
+                self._history_fetched_at[cache_key] = datetime.now(UTC)
+                return sliced
+            # 派生不出（1年 也拿不到）就照常回源，行为与改造前一致。
         if period == "1年":
             # 内存未命中/过期：先试数据库快照（落库只写 1年 窗口，回收也只对
             # 这个周期生效）。命中就回填缓存直接返回，失败或过期照常打上游。

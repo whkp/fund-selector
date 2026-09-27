@@ -79,15 +79,23 @@ export type MarketQuoteResponse = {
   disclaimer: string
 }
 
-type FundListResponse = { items: Fund[] }
+type FundListResponse = { items: Fund[]; qualityStatus?: string; message?: string }
 type WatchlistResponse = { items: Array<{ fund: Fund }> }
 
-export async function fetchFunds(): Promise<Fund[]> {
+export type FundsResult =
+  | { loading: true; message: string }
+  | { loading: false; funds: Fund[] }
+
+export async function fetchFunds(): Promise<FundsResult> {
   // 首次请求会触发服务端抓一遍 AKShare 全量基金列表，比普通读接口慢得多。
+  // 冷启动期间服务端返回 qualityStatus=LOADING，前端显示骨架屏而非空列表。
   const payload = await request<FundListResponse>('/funds', undefined, {
     timeoutMs: TIMEOUT_MS.upstream,
   })
-  return payload.items
+  if (payload.qualityStatus === 'LOADING') {
+    return { loading: true, message: payload.message ?? '基金数据装载中，请稍候…' }
+  }
+  return { loading: false, funds: payload.items }
 }
 
 /**
