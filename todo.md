@@ -5,7 +5,7 @@
 > 并同步更新 `AGENTS.md`。
 > 约定：代码/测试/git 在 WSL Ubuntu-24.04 执行（远程 push 走 Windows 侧）；测试不触网、不用真实密钥。
 
-**当前状态**：阶段一完成 ✅，前端动效升级完成 ✅，当前进行阶段二。
+**当前状态**：阶段一完成 ✅，前端动效升级完成 ✅，阶段二核心完成 ✅（评分引擎 + 前端维度条），当前进行 2.5 预设按钮 + 2.6 验证。
 
 ---
 
@@ -54,7 +54,67 @@
 
 ## 阶段二：透明多维评分 + 新手决策引导（当前阶段）
 
-### 2.1 新建 `backend/app/scoring.py` — 多维评分引擎
+### ✅ 2.1 新建 `backend/app/scoring.py` — 多维评分引擎（已完成）
+
+`compute_score(fund, universe?)` 五维度：近1年收益(30%)、风险控制(25%)、成本效率(20%)、规模健康(15%)、经理经验(10%)。全集百分位归一化；无全集时绝对值兜底；缺字段 null 透明降级不计入分母。`score_parts` 每项含 `label/value/weight/color/raw/basis`，版本 `score-v1`。
+
+---
+
+### ✅ 2.2 评分集成到数据管道（已完成）
+
+`providers.py` `refresh_funds()` / `adopt_universe()` 加全集重算（`asyncio.to_thread(_recompute_scores)`）；`enrichment.py` 单只补数后就地重算；移除旧启发式评分。
+
+---
+
+### ✅ 2.3 前端接真实 scoreParts（已完成）
+
+`types.ts` 升级 `ScorePart` 类型（`value: number | null`，新增 `raw` / `basis`）；卡片加 3 条迷你进度条（tooltip 含 basis）；详情抽屉展示全部 5 条维度分解，错落入场；`.card-score-bars` / `.drawer-score-parts` 新样式。
+
+---
+
+### ✅ 2.4 reason 字段升级（已完成）
+
+`build_reason()` 取最强 2~3 条有效维度拼一句话结论，兜底文案「数据待补充」。`adopt_universe` 和 `enrich_fund` 后自动更新。
+
+---
+
+### 2.5 场景预设按钮（一键筛选）
+
+> **目标**：新手不用填写任何条件，点一下「4433 策略」或「低回撤稳健」就能看到合适的候选。
+
+**后端**（`main.py`，`/api/funds/screen` 或在现有 `screen_funds` 增加 `preset` 参数）：
+```python
+PRESETS = {
+    "4433": ScreenRequest(filters=FilterCriteria(maxFee=1.0, riskLevelMax="中高风险"), query="4433"),
+    "低回撤稳健": ScreenRequest(filters=FilterCriteria(maxFee=0.8, riskLevelMax="中风险"), query="回撤小 稳健"),
+    "科技主题": ScreenRequest(filters=FilterCriteria(fundTypes=["股票型"]), query="科技 半导体 AI"),
+}
+```
+- `GET /api/funds/screen?preset=4433` 返回与现有 `/api/funds?q=...` 相同的 envelope 结构。
+- preset 不存在时返回 400，不静默降级。
+- 路由挂 `Depends(current_user)`。
+
+**前端**（`src/App.vue`，筛选面板顶部）：
+- 三个预设按钮：「📈 4433 策略」「🛡️ 低回撤稳健」「💡 科技主题」。
+- 新增 `activePreset = ref('')` 和 `fetchPreset(name)` 函数；点击后调用 `/api/funds/screen?preset=xxx`，结果覆盖 `availableFunds`，高亮激活的预设按钮。
+- 清除预设按钮（或搜索时）重置 `activePreset`，回到浏览视图。
+- `src/services/fund-api.ts` 新增 `fetchPreset(name)` 函数。
+
+---
+
+### 2.6 阶段二验证
+
+- [ ] `backend/tests/test_scoring.py`（已有 18 个用例）新增：
+  - `build_reason` 含数字的 edge case（`raw="--"` 的基金）
+- [ ] `test_api.py` 新增：
+  - `/api/funds` 返回的基金 `scoreParts` 非空（至少 1 条有效维度）。
+  - `/api/funds/screen?preset=4433` 返回 200 且 items 非空。
+  - `/api/funds/screen?preset=不存在` 返回 400。
+- [ ] 前端 `typecheck` 干净；本地启动后手动验证：
+  - 卡片显示真实维度条（非全灰「未获取」短条）。
+  - 抽屉进度条有颜色有数字，`null` 维度显示「未获取」。
+  - 预设按钮点击后候选列表更新，激活态高亮。
+- [ ] 全量 `pytest` + `ruff` 绿，更新 `AGENTS.md`。
 
 > **目标**：把卡片上的四条假进度条换成有意义的真实数字，每维度都有数据来源说明。
 

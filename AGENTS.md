@@ -30,8 +30,11 @@ fund-selector/
 │   ├── app/
 │   │   ├── main.py             # 全部 API 路由 + lifespan + 中间件（约 1000 行，路由集中在此）
 │   │   ├── providers.py        # AKShareProvider（上游适配）+ DataRepository（内存 TTL 缓存、
-│   │   │                       #   目录/NAV 落库调度、数据库回收）
-│   │   ├── enrichment.py       # 按需补数：雪球 basic_info/achievement + 蛋卷 risk_level
+│   │   │                       #   目录/NAV 落库调度、数据库回收、全集评分重算）
+│   │   ├── scoring.py          # 多维评分引擎（score-v1）：五维度归一化、全集百分位、
+│   │   │                       #   透明降级、build_reason() 一句话结论
+│   │   ├── enrichment.py       # 按需补数：雪球 basic_info/achievement + 蛋卷 risk_level，
+│   │   │                       #   补数后就地重算该只评分
 │   │   ├── llm.py              # OpenAI-compatible / Ollama 客户端 + 输出校验
 │   │   ├── agent_service.py    # agent 模式研究编排（tau harness 工具循环）
 │   │   ├── agent_tools.py      # agent 工具集（search_funds / get_fund_detail / 净值历史等）
@@ -51,7 +54,7 @@ fund-selector/
 │   │   │   └── nav_repository.py       # 历史 NAV 持久化 + load_latest_history 回收
 │   │   └── workers/            # fund_universe（目录同步）/ nav_history（骨架）/ scheduler（单次）
 │   ├── migrations/             # Alembic；env.py 含日志关键修复（见第 8 节）
-│   ├── tests/                  # 17 个文件、142 项（不触网，见第 5 节）
+│   ├── tests/                  # 18 个文件、160 项（不触网，见第 5 节）
 │   ├── tau_agent/ tau_ai/      # vendored 自 huggingface/tau（MIT，不参与本仓库 lint）
 │   ├── requirements.txt        # 开发用版本区间；部署用 requirements.lock（精确版本）
 │   └── run.py                  # 后端入口：UTF-8 流重配 + dotenv + uvicorn
@@ -201,7 +204,7 @@ cd /mnt/c/Users/hkp/fund-selector/backend
   `conversations`、`conversation_messages`、`risk_profiles`、`watchlist_items`、
   `recommendation_runs`、`recommendation_steps`
 - **结构变更必须写 alembic 迁移**：`Base.metadata.create_all` 只建缺失的表、从不 ALTER
-- 迁移 head（截至 2026-09-26）：`20260926_0003`（raw 快照 gzip 列）
+- 迁移 head（截至 2026-09-27）：`20260926_0003`（raw 快照 gzip 列）
 - `recommendation_runs` / `recommendation_steps` 表已建但**暂无代码使用**
 - `outbox_events` 无消费者（写入但无人派发）
 
@@ -238,6 +241,12 @@ cd /mnt/c/Users/hkp/fund-selector/backend
 11. **产品边界**：AKShare/雪球/蛋卷均标记 LOW 信任公开参考；不能当授权生产数据；
     普通基金 NAV 是日频披露，不是盘中实时。
 12. **注释与文档用中文**，注释要解释「为什么」而不是复述代码（项目一贯风格）。
+13. **评分计算必须在线程池里跑**：`_recompute_scores(funds)` 对全集 2 万只基金做归一化，
+    若在事件循环里执行会阻塞所有请求。调用方式：`await asyncio.to_thread(_recompute_scores, funds)`。
+14. **新增评分维度必须同步更新 `scoring.py`、`types.ts` 的 `ScorePart` 类型、
+    以及 `test_scoring.py` 的边界用例**；三者不同步会导致前端渲染异常或测试漏洞。
+15. **`scoring.py` 是纯函数模块**：无 IO、无 asyncio、无数据库调用，可安全在线程池或同步上下文调用；
+    不要在里面引入任何异步依赖。
 
 ## 9. 常见任务手册
 
@@ -257,6 +266,12 @@ cd /mnt/c/Users/hkp/fund-selector/backend
 - NAV 仅 `1年` 窗口落库/回收；其余窗口每次回源
 - `workers/nav_history.py` 批量预填充尚未接调度
 - `recommendation_runs` / `recommendation_steps` 表未启用；研究记录目前仅存于对话
+- `outbox_events` 无消费者（写入但无人派发）
+- 前端无路由/Pinia；`dist/` 需手动 `npm run build` 后同步
+- `docs/开发进展.md` 停留在 2026-09-10，晚于它的进展以本文件与 README 为准
+- 数据源状态在「仅从 DB 装载、未打上游」时显示 `PENDING`（前端可能提示"等待首个快照"，语义正确但略易困惑）
+- 评分（score-v1）的规模/经理年限维度在 AKShare 目录不提供这两个字段时必须经过雪球补数才能拿到非 null 值；冷启动阶段的基金这两维度会显示「未获取」，补数后自动更新
+- 场景预设按钮（4433/低回撤稳健/科技主题）尚未实现（todo 2.5）
 - `outbox_events` 无消费者
 - 前端无路由/Pinia；`dist/` 需手动 `npm run build` 后同步
 - `docs/开发进展.md` 停留在 2026-09-10，晚于它的进展以本文件与 README 为准
