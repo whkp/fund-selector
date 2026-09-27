@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   Activity, ArrowDownUp, ArrowUpRight, BarChart3, BellRing, Bot, CalendarClock,
   Check, ChevronDown, ChevronRight, CircleAlert, Clock3, Compass, Database,
@@ -471,7 +471,33 @@ const selectedChart = computed(() => {
   }
   return []
 })
-function chartLine(fund: Fund | null) {
+// ---- 评分数字动态计数器（打开详情抽屉时从 0 跳到目标分） ----
+const animatedScore = ref(0)
+let scoreTimer: number | undefined
+
+function animateScore(target: number) {
+  if (scoreTimer !== undefined) window.clearInterval(scoreTimer)
+  animatedScore.value = 0
+  const duration = 600
+  const steps = 30
+  const interval = duration / steps
+  const increment = target / steps
+  let current = 0
+  scoreTimer = window.setInterval(() => {
+    current += increment
+    if (current >= target) {
+      animatedScore.value = target
+      window.clearInterval(scoreTimer)
+      scoreTimer = undefined
+    } else {
+      animatedScore.value = Math.round(current)
+    }
+  }, interval)
+}
+
+watch(() => selectedFund.value, (fund) => {
+  if (fund) animateScore(fund.score)
+})
   if (!fund) return ''
   const points = selectedChart.value
   if (!points.length) return ''
@@ -586,6 +612,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (marketTimer !== undefined) window.clearInterval(marketTimer)
+  if (scoreTimer !== undefined) window.clearInterval(scoreTimer)
   stopDataLoadingPoll()
   window.clearTimeout(searchTimer)
   stopTracePolling()
@@ -868,7 +895,7 @@ onBeforeUnmount(() => {
     <div v-if="selectedFund" class="overlay" @click.self="selectedFund = null">
       <aside class="detail-drawer">
         <header><div><p class="eyebrow">基金详情 · {{ selectedHistory?.mode ?? 'REFERENCE' }}</p><h2>{{ selectedFund.shortName }}</h2><p>{{ selectedFund.name }} · {{ selectedFund.code }}</p></div><button class="icon-button" aria-label="关闭详情" @click="selectedFund = null"><X :size="19" /></button></header>
-        <div class="drawer-score-row"><div class="drawer-score"><span>参考排序</span><strong>{{ selectedFund.score }}</strong><small>/100</small></div><div><span class="quality-tag" :class="selectedFund.status">{{ selectedFund.status }}</span><p>{{ selectedFund.reason }}</p></div></div>
+        <div class="drawer-score-row"><div class="drawer-score"><span>参考排序</span><strong>{{ animatedScore }}</strong><small>/100</small></div><div><span class="quality-tag" :class="selectedFund.status">{{ selectedFund.status }}</span><p>{{ selectedFund.reason }}</p></div></div>
         <div class="chart-panel"><div class="chart-label"><span>单位净值走势</span><small>{{ historyLoading ? '正在读取历史净值...' : selectedHistory?.items.length ? `AKShare · ${selectedHistory.items.length} 个交易日` : 'AKShare 未返回历史净值' }}</small></div><svg v-if="selectedHistory?.items.length" viewBox="0 0 300 104" role="img" aria-label="单位净值走势"><defs><linearGradient id="chartFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#1d6b68" stop-opacity=".22"/><stop offset="100%" stop-color="#1d6b68" stop-opacity="0"/></linearGradient></defs><path :d="chartArea(selectedFund)" fill="url(#chartFill)"/><path :d="chartLine(selectedFund)" fill="none" stroke="#1d6b68" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
         <div class="metric-grid"><div><span>单位净值</span><b>{{ fmtNumber(selectedFund.nav, 4) }}</b><small>{{ selectedFund.navDate || '未获取' }}</small></div><div><span>区间收益</span><b class="positive">{{ fmtPercent(selectedHistory?.metrics?.totalReturn as number | undefined) }}</b><small>{{ selectedHistory?.period ?? '历史数据未获取' }}</small></div><div><span>年化波动</span><b>{{ fmtPercent(selectedHistory?.metrics?.volatility as number | undefined) }}</b><small>{{ selectedHistory?.metricVersion ?? '未计算' }}</small></div><div><span>最大回撤</span><b>{{ fmtPercent(selectedHistory?.metrics?.drawdown as number | undefined) }}</b><small>历史窗口</small></div><div><span>管理费率</span><b>{{ fmtPercent(selectedFund.fee) }}</b><small>AKShare 排行字段</small></div><div><span>数据质量</span><b>{{ selectedHistory?.metricStatus ?? selectedFund.qualityStatus ?? selectedFund.status }}</b><small>{{ selectedHistory?.sourceType ?? selectedFund.navSourceType ?? 'AKSHARE_PUBLIC' }} · {{ selectedHistory?.trustLevel ?? selectedFund.navTrustLevel ?? 'LOW' }}</small></div></div>
         <section class="drawer-section"><h3>研究证据</h3><div class="evidence-list"><div><Check :size="15" /><span>净值与指标：{{ selectedFund.navDate }} · 已通过数据质量检查</span></div><div><Check :size="15" /><span>来源：{{ selectedFund.source }}</span></div><div><CircleAlert :size="15" /><span>{{ selectedFund.caveat }}</span></div></div></section>

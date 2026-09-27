@@ -558,3 +558,132 @@ button.avatar:hover { transform: scale(1.06); }
 /* ============ 卡片收益数字着色 ============ */
 .fund-stats strong.negative { color: var(--down); }
 .fund-stats strong.positive { color: var(--up); }
+
+/* ============ 动效升级：卡片微光 + 浮起 ============ */
+/* hover 微光扫过：覆盖在卡片上层 */
+.fund-card { overflow: hidden; }
+.fund-card::after {
+  position: absolute; inset: 0; content: '';
+  background: linear-gradient(105deg, transparent 35%, rgba(255,255,255,.08) 50%, transparent 65%);
+  opacity: 0; transform: translateX(-60%);
+  pointer-events: none; transition: none;
+}
+.fund-card:hover::after {
+  opacity: 1; transform: translateX(60%);
+  transition: transform .55s var(--ease-out), opacity .1s ease;
+}
+/* 第一张卡片金色左边框更亮 */
+.fund-card:first-of-type::before { background: linear-gradient(180deg, var(--gold-400), var(--gold-500)); opacity: 0; }
+.fund-card:first-of-type:hover::before { opacity: 1; }
+
+/* ============ 侧边栏 Nav 激活指示器滑块 ============ */
+.nav-list { position: relative; }
+.nav-item { z-index: 1; }
+
+/* ============ 研究按钮：脉冲光晕 ============ */
+.run-button:not(:disabled):not(:hover) { animation: run-pulse 3s ease-in-out infinite; }
+@keyframes run-pulse {
+  0%, 100% { box-shadow: 0 4px 14px rgba(26, 51, 88, .28), inset 0 1px 0 rgba(255,255,255,.12); }
+  50% { box-shadow: 0 4px 22px rgba(26, 51, 88, .42), 0 0 0 4px rgba(30, 58, 102, .12), inset 0 1px 0 rgba(255,255,255,.14); }
+}
+
+/* ============ 详情抽屉评分数字：光晕 + 计数 ============ */
+.drawer-score strong {
+  display: inline-block;
+  background: linear-gradient(135deg, var(--navy-800), var(--navy-500));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  filter: drop-shadow(0 0 8px rgba(30, 58, 102, .22));
+  animation: score-pop .5s var(--ease-out) both;
+}
+@keyframes score-pop {
+  from { opacity: 0; transform: scale(.7) translateY(4px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* ============ 详情抽屉入场优化 ============ */
+.detail-drawer { animation: drawer-in .28s var(--ease-out); }
+@keyframes drawer-in { from { transform: translateX(38px); opacity: .3; } to { transform: translateX(0); opacity: 1; } }
+
+/* 抽屉内各区块错落入场 */
+.detail-drawer > header { animation: rise .22s .04s var(--ease-out) both; }
+.drawer-score-row       { animation: rise .22s .09s var(--ease-out) both; }
+.chart-panel            { animation: rise .22s .14s var(--ease-out) both; }
+.metric-grid            { animation: rise .22s .19s var(--ease-out) both; }
+.drawer-section         { animation: rise .22s .24s var(--ease-out) both; }
+.detail-drawer footer   { animation: rise .22s .28s var(--ease-out) both; }
+
+/* ============ 研究进度：步骤入场更丝滑 ============ */
+.progress-step { animation: step-slide .32s var(--ease-out) both; }
+.progress-step:nth-child(1) { animation-delay: 0s; }
+.progress-step:nth-child(2) { animation-delay: .06s; }
+.progress-step:nth-child(3) { animation-delay: .12s; }
+.progress-step:nth-child(4) { animation-delay: .18s; }
+.progress-step:nth-child(5) { animation-delay: .24s; }
+.progress-step:nth-child(n+6) { animation-delay: .3s; }
+@keyframes step-slide {
+  from { opacity: 0; transform: translateX(-10px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+/* ============ Nav 切换：内容区淡入上移 ============ */
+.research-view, .module-view { animation: section-enter .3s var(--ease-out) both; }
+@keyframes section-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ============ Toast：更丝滑弹出 + 消失 ============ */
+.toast {
+  border: 1px solid rgba(221, 186, 114, .45);
+  box-shadow: 0 12px 32px rgba(10, 18, 32, .38), 0 0 0 1px rgba(221, 186, 114, .12);
+  animation: toast-pop .28s var(--ease-out);
+}
+@keyframes toast-pop {
+  from { opacity: 0; transform: translateY(18px) scale(.93); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* ============ 侧边栏品牌区：呼吸光环 ============ */
+.brand-mark {
+  animation: brand-breathe 4s ease-in-out infinite;
+}
+@keyframes brand-breathe {
+  0%, 100% { box-shadow: 0 0 16px rgba(221, 186, 114, .22), inset 0 0 8px rgba(221, 186, 114, .1); }
+  50%       { box-shadow: 0 0 28px rgba(221, 186, 114, .38), inset 0 0 12px rgba(221, 186, 114, .18); }
+}
+
+/* ============ 罗盘核心：更强烈的呼吸 ============ */
+@keyframes core-breathe {
+  0%, 100% {
+    box-shadow: 0 2px 10px rgba(26, 51, 88, .12), 0 0 0 0 rgba(201, 162, 75, .22);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow: 0 2px 14px rgba(26, 51, 88, .18), 0 0 0 8px rgba(201, 162, 75, 0);
+    transform: scale(1.03);
+  }
+}
+
+/* ============ 骨架屏动效：错落延迟 ============ */
+.skeleton-card:nth-child(2) .skel { animation-delay: .08s; }
+.skeleton-card:nth-child(3) .skel { animation-delay: .16s; }
+.skeleton-card:nth-child(4) .skel { animation-delay: .24s; }
+.skeleton-card:nth-child(5) .skel { animation-delay: .32s; }
+.skeleton-card:nth-child(6) .skel { animation-delay: .40s; }
+
+/* ============ 搜索框聚焦：光晕扩散 ============ */
+.search-wrap:focus-within {
+  border-color: var(--navy-600);
+  box-shadow: 0 0 0 3px rgba(31, 58, 105, .1), 0 2px 8px rgba(31, 58, 105, .08);
+  transition: box-shadow .22s var(--ease-out), border-color .18s ease;
+}
+
+/* ============ 评分进度条：生长更流畅 ============ */
+.score-line i {
+  animation: bar-grow .7s var(--ease-out) both;
+  transform-origin: left;
+}
+.score-line:nth-child(2) i { animation-delay: .08s; }
+.score-line:nth-child(3) i { animation-delay: .16s; }
+.score-line:nth-child(4) i { animation-delay: .24s; }
+.score-line:nth-child(5) i { animation-delay: .32s; }
