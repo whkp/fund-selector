@@ -678,12 +678,18 @@ button.avatar:hover { transform: scale(1.06); }
   transition: box-shadow .22s var(--ease-out), border-color .18s ease;
 }
 
-/* ============ 评分进度条：生长更流畅 ============ */
-.score-line i {
-  animation: bar-grow .7s var(--ease-out) both;
-  transform-origin: left;
-}
-.score-line:nth-child(2) i { animation-delay: .08s; }
-.score-line:nth-child(3) i { animation-delay: .16s; }
-.score-line:nth-child(4) i { animation-delay: .24s; }
-.score-line:nth-child(5) i { animation-delay: .32s; }
+/* ============ 卡片内迷你评分条 ============ */
+.card-score-bars { display: grid; gap: 3px; margin-top: 6px; }
+.card-score-bar { display: grid; align-items: center; }
+.card-bar-track { height: 3px; background: #e8edf5; border-radius: 4px; overflow: hidden; }
+.card-bar-fill { height: 100%; border-radius: 4px; transform-origin: left; animation: bar-grow .7s var(--ease-out) both; }
+
+/* ============ 评分条：详情抽屉 ============ */
+.drawer-score-parts { display: grid; gap: 8px; margin-top: 12px; }
+.drawer-score-part { display: grid; grid-template-columns: 68px 1fr 36px; gap: 6px; align-items: center; font-size: 10px; }
+.drawer-score-part .part-label { color: var(--ink-500); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.drawer-score-part .part-bar { height: 5px; background: #e8edf5; border-radius: 4px; overflow: hidden; }
+.drawer-score-part .part-fill { height: 100%; border-radius: 4px; transform-origin: left; animation: bar-grow .8s var(--ease-out) both; }
+.drawer-score-part .part-val { color: var(--ink-600); font-family: 'IBM Plex Mono', monospace; font-size: 9px; text-align: right; }
+.drawer-score-part .part-val.null-val { color: var(--ink-300); }
+.part-basis { color: var(--ink-300); font-family: 'IBM Plex Mono', monospace; font-size: 8px; margin-top: 1px; grid-column: 2 / 4; }

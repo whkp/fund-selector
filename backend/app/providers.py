@@ -9,6 +9,7 @@ from typing import Any
 
 from .config import config_value
 from .models import Fund, SourceStatus
+from .scoring import build_reason, compute_score
 
 logger = logging.getLogger(__name__)
 
@@ -224,26 +225,37 @@ class AKShareProvider:
         nav_date = str(row.get("日期", ""))
         type_name = str(directory_row.get("基金类型", "未知"))
         one_year = number("近1年")
-        three_month = number("近3月")
-        # This is an explicit ordering heuristic based only on returned AKShare fields,
-        # not a recommendation score or a substituted third-party value.
-        score = max(0, min(100, round(
-            50 + (one_year or 0) * 0.18 - max((one_year or 0) - (three_month or 0), 0) * 0.04
-            - max((fee or 0) - 0.5, 0) * 5
-        )))
-        return Fund(
+        # three_month 被旧启发式用过，新评分引擎不需要；保留读取避免破坏列解析顺序。
+        _ = number("近3月")
+        # 用多维评分引擎计算排序分（兜底模式：无全集，按单只绝对值插值）。
+        # 全集百分位重算在 adopt_universe / refresh_funds 里批量完成。
+        score, score_parts = compute_score(
+            Fund(
+                id=f"ak-{code}", code=code, name=name, short_name=name[:16], type=type_name,
+                risk="未获取", manager="未获取", manager_years=None, company="未获取", theme="未标注",
+                nav=nav, accumulated_nav=number("累计净值"), nav_date=nav_date,
+                ytd=number("今年来"), one_year=one_year, volatility=None, drawdown=None,
+                fee=fee, scale=None, inception=None, score=0, score_parts=[],
+                reason="", caveat="", highlights=[], status="待核",
+                source="AKShare public reference", snapshot=f"akshare-rank-{nav_date}", chart=[], tags=[],
+                intake="未获取", quality_status="REFERENCE", nav_source_type="AKSHARE_PUBLIC",
+                nav_trust_level="LOW", nav_freshness="REFERENCE",
+            )
+        )
+        fund = Fund(
             id=f"ak-{code}", code=code, name=name, short_name=name[:16], type=type_name,
             risk="未获取", manager="未获取", manager_years=None, company="未获取", theme="未标注",
             nav=nav, accumulated_nav=number("累计净值"), nav_date=nav_date,
             ytd=number("今年来"), one_year=one_year, volatility=None, drawdown=None,
-            fee=fee, scale=None, inception=None, score=score, score_parts=[],
-            reason="按 AKShare 当前公开排行字段排序；未获得的主数据不参与计算。",
-            caveat="风险等级、基金经理、规模和申购状态尚未由当前数据入口提供，需进一步核验。",
+            fee=fee, scale=None, inception=None, score=score, score_parts=score_parts,
+            reason="", caveat="风险等级、基金经理、规模和申购状态尚未由当前数据入口提供，需进一步核验。",
             highlights=["单位净值已获取", "区间收益已获取"], status="待核",
             source="AKShare public reference", snapshot=f"akshare-rank-{nav_date}", chart=[], tags=[],
             intake="未获取", quality_status="REFERENCE", nav_source_type="AKSHARE_PUBLIC",
             nav_trust_level="LOW", nav_freshness="REFERENCE",
         )
+        fund.reason = build_reason(fund, score_parts)
+        return fund
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +339,20 @@ def query_relevance_scores(query: str, index: dict[str, list[tuple[str, int]]]) 
     return scores
 
 
+def _recompute_scores(funds: list[Fund]) -> list[Fund]:
+    """全集百分位重算评分（在线程池调用，不占事件循环）。
+
+    原地修改每只基金的 score / score_parts / reason 并返回同一列表，
+    让调用方可以直接用返回值而不必再遍历一次。
+    """
+    for fund in funds:
+        score, parts = compute_score(fund, universe=funds)
+        fund.score = score
+        fund.score_parts = parts
+        fund.reason = build_reason(fund, parts)
+    return funds
+
+
 class DataRepository:
     """In-memory repository with TTL-bounded caches.
 
@@ -379,13 +405,15 @@ class DataRepository:
             return False
         # Replace the universe atomically so a failed or partial refresh cannot
         # mix stale records into the current public reference dataset.
-        self.funds = {item.code: item for item in items}
+        # 全集重算评分（在线程里跑，避免 2 万只计算占事件循环）。
+        scored_items = await asyncio.to_thread(_recompute_scores, items)
+        self.funds = {item.code: item for item in scored_items}
         # 索引构建对 2 万只基金要扫几十万次字符串，丢进线程别占事件循环。
-        self._gram_index = await asyncio.to_thread(build_gram_index, items)
+        self._gram_index = await asyncio.to_thread(build_gram_index, scored_items)
         self.histories.clear()
         self._history_fetched_at.clear()
         self._funds_fetched_at = datetime.now(UTC)
-        self._schedule_universe_persist(items)
+        self._schedule_universe_persist(scored_items)
         return True
 
     async def adopt_universe(self, funds: list[Fund], fetched_at: datetime | None = None) -> None:
@@ -396,9 +424,11 @@ class DataRepository:
         """
         if not funds:
             return
-        self.funds = {fund.code: fund for fund in funds}
+        # 全集百分位重算（数据库快照可能是旧版无评分，统一补算一次）。
+        scored = await asyncio.to_thread(_recompute_scores, funds)
+        self.funds = {fund.code: fund for fund in scored}
         # 索引构建对 2 万只基金要扫几十万次字符串，丢进线程别占事件循环。
-        self._gram_index = await asyncio.to_thread(build_gram_index, funds)
+        self._gram_index = await asyncio.to_thread(build_gram_index, scored)
         if fetched_at is not None and fetched_at.tzinfo is None:
             # SQLite 等无时区列读回来是 naive datetime，按 UTC 解读。
             fetched_at = fetched_at.replace(tzinfo=UTC)

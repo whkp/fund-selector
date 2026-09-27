@@ -236,6 +236,12 @@ async def enrich_fund(repository: Any, code: str) -> dict[str, Any] | None:
         _apply("volatility", _compute_volatility(repository, code))
 
     if updated:
+        # 补数后重算该只基金的评分（拿到了规模/回撤/经理年限，分数会变）。
+        from .scoring import build_reason, compute_score
+        score, parts = compute_score(fund)
+        fund.score = score
+        fund.score_parts = parts
+        fund.reason = build_reason(fund, parts)
         # 新经理/主题要能立刻被 n-gram 检索命中
         repository._gram_index = await asyncio.to_thread(
             build_gram_index, list(repository.funds.values()),
